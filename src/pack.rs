@@ -397,9 +397,8 @@ impl Pack {
     /// Empty when the pack names none.
     pub fn datasets(&self) -> Vec<(&str, u64)> {
         let mut counts = vec![0u64; self.origin_names.len() + 1];
-        for pair in self.origins.as_ref().chunks_exact(2) {
-            let id = usize::from(u16::from_le_bytes([pair[0], pair[1]]));
-            if let Some(n) = counts.get_mut(id) {
+        for record in 0..self.origins.as_ref().len() / 2 {
+            if let Some(n) = counts.get_mut(usize::from(self.origin_at(record))) {
                 *n += 1;
             }
         }
