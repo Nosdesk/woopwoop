@@ -5,4 +5,5 @@ This software is licensed under the Apache License, Version 2.0.
 
 The street type table in src/street_types.rs is derived from the authority
 tables published with G-NAF. See the README for how G-NAF data is licensed.
-No address data is distributed with this software.
+No address data is distributed with this software, and packs built from address
+data carry that data's own licences.

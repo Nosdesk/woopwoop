@@ -16,6 +16,8 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup component add rustfmt clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build -p woopwoop-tiles --target wasm32-unknown-unknown --profile wasm
