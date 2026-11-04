@@ -6,17 +6,23 @@ use crate::normal::{normalise_for, normalise_place, postcode_label, title, Count
 use crate::parse::{parse, Address, Gazetteer, Parsed};
 use fst::{IntoStreamer, Map, Streamer};
 use memmap2::Mmap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) const MAGIC: &[u8; 8] = b"WOOPWOOP";
-pub(crate) const VERSION: u32 = 4;
-pub(crate) const SECTIONS: usize = 9;
+pub(crate) const VERSION: u32 = 5;
+pub(crate) const SECTIONS: usize = 11;
 
 /// How far an unmatched suburb may be from where the query points and still count.
 const NEARBY_METRES: f64 = 12_000.0;
+/// How many same-named towns another pack can offer one search.
+const MAX_TOWNS: usize = 16;
+/// Grid size for finding a town by position, in degrees.
+const TOWN_CELL: f64 = 0.1;
+/// How many cells out to look for a town.
+const TOWN_CELLS: i32 = 6;
 const MAX_CANDIDATES: usize = 5;
 const MAX_FUZZY_STREETS: usize = 64;
 const MAX_FUZZY_SCAN: usize = 2_000;
@@ -70,6 +76,9 @@ pub struct Candidate {
     /// False when this is in a different suburb and postcode from the ones asked
     /// for. People mix up neighbouring suburbs, so it's worth offering, but say so.
     pub place_confirmed: bool,
+    /// Where this came from: the dataset for a listed house, otherwise the pack's source,
+    /// as a street or town result draws on many records.
+    pub source: String,
 }
 
 /// Why a search has no result. Declining beats a confident wrong pin.
@@ -101,17 +110,22 @@ pub struct Query {
 }
 
 /// Searches several packs and returns the most precise answer, preferring earlier packs
-/// on a tie. Layering packs keeps sources with different licences in separate files,
-/// and improves a region by adding a pack.
+/// on a tie. A region improves by adding a pack, and data under a different licence can
+/// stay in a file of its own, as packs only meet here, at search time.
 pub fn search_all(packs: &[Pack], text: &str) -> Outcome {
     let mut best: Option<Outcome> = None;
     let rank = |c: &[Candidate]| (!c[0].place_confirmed, c[0].precision);
-    for pack in packs {
+    // For a town alone, a list of towns knows better than the middle of its addresses.
+    let mut order: Vec<&Pack> = packs.iter().collect();
+    if packs.iter().any(|p| p.reads_as_bare_town(text)) {
+        order.sort_by_key(|p| !p.has_towns());
+    }
+    for pack in order {
         if matches!(&best, Some(Outcome::Found(c)) if c[0].precision == Precision::House && c[0].place_confirmed)
         {
             break;
         }
-        let outcome = pack.search(text);
+        let outcome = pack.search_near(text, &Elsewhere::for_search(packs, pack, text));
         best = Some(match (best.take(), outcome) {
             (None, o) => o,
             (Some(Outcome::Declined(Declined::PostalAddress)), _) => {
@@ -125,6 +139,42 @@ pub fn search_all(packs: &[Pack], text: &str) -> Outcome {
         });
     }
     best.unwrap_or(Outcome::Declined(Declined::NotFound))
+}
+
+/// What other packs can say about the town asked for, for one search. A pack of addresses
+/// with no town list uses this to place its records. The packs stay separate files, and
+/// nothing from one is stored in another.
+#[derive(Default)]
+struct Elsewhere<'a> {
+    /// Where the other packs put the town.
+    anchors: Vec<(f64, f64)>,
+    /// The packs holding a town list.
+    towns: Vec<&'a Pack>,
+}
+
+impl<'a> Elsewhere<'a> {
+    fn for_search(packs: &'a [Pack], pack: &Pack, text: &str) -> Self {
+        let Parsed::Address(a) = parse(text, pack) else {
+            return Self::default();
+        };
+        if a.locality.is_empty() {
+            return Self::default();
+        }
+        let others = || packs.iter().filter(|p| !std::ptr::eq(*p, pack));
+        Self {
+            anchors: others()
+                .flat_map(|p| p.town_points(&a.locality, &a.region))
+                .collect(),
+            towns: others().filter(|p| p.has_towns()).collect(),
+        }
+    }
+
+    /// Whether `locality` is the nearest town to a position.
+    fn is_nearest_town(&self, locality: &str, at: (f64, f64)) -> bool {
+        self.towns
+            .iter()
+            .any(|p| p.nearest_town(at).is_some_and(|t| t.name == locality))
+    }
 }
 
 struct Slice {
@@ -156,9 +206,13 @@ pub struct Pack {
     name_offsets: Slice,
     name_text: Slice,
     postcodes: Map<Slice>,
+    origins: Slice,
+    origin_names: Vec<String>,
     numbers: Vec<String>,
     numeric: Vec<i64>,
     places: Vec<Place>,
+    /// Towns by grid cell, when this pack was built with a town list.
+    town_grid: HashMap<(i32, i32), Vec<u32>>,
     by_locality: HashMap<String, Vec<u32>>,
     by_postcode: HashMap<String, Vec<u32>>,
     source: String,
@@ -172,6 +226,7 @@ struct Hit {
     place: u32,
     score: u8,
     number: u32,
+    origin: u16,
     lat: f64,
     lon: f64,
 }
@@ -182,6 +237,10 @@ fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
     let dlon = (b.1 - a.1).to_radians() / 2.0;
     let x = dlat.sin().powi(2) + la.cos() * lb.cos() * dlon.sin().powi(2);
     12_742_000.0 * x.sqrt().asin()
+}
+
+fn town_cell(v: f64) -> i32 {
+    (v / TOWN_CELL).floor() as i32
 }
 
 fn leading_number(s: &str) -> Option<i64> {
@@ -229,12 +288,21 @@ impl Pack {
         if records.as_ref().len() % 16 != 0 || groups.as_ref().len() % 4 != 0 {
             return Err(Error::Invalid("bad record table"));
         }
+        let origins = section(9)?;
+        if !origins.as_ref().is_empty() && origins.as_ref().len() != records.as_ref().len() / 8 {
+            return Err(Error::Invalid("bad origin table"));
+        }
         let text = |s: Slice| -> Result<String, Error> {
             std::str::from_utf8(s.as_ref())
                 .map(str::to_string)
                 .map_err(|_| Error::Invalid("bad text section"))
         };
         let numbers: Vec<String> = text(section(3)?)?.split('\n').map(str::to_string).collect();
+        let origin_names: Vec<String> = text(section(10)?)?
+            .split('\n')
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect();
         let numeric = numbers
             .iter()
             .map(|n| leading_number(n).unwrap_or(-1))
@@ -273,6 +341,17 @@ impl Pack {
                 .find_map(|l| l.strip_prefix(name).map(str::to_string))
         };
         let source = field("source=").unwrap_or_default();
+        let mut town_grid: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+        if field("towns=").is_some_and(|n| n != "0") {
+            for (i, p) in places.iter().enumerate() {
+                if p.postcode.is_empty() && !p.name.is_empty() {
+                    town_grid
+                        .entry((town_cell(p.lat), town_cell(p.lon)))
+                        .or_default()
+                        .push(i as u32);
+                }
+            }
+        }
         let country = field("country=")
             .and_then(|c| Country::from_code(&c))
             .unwrap_or_default();
@@ -283,9 +362,12 @@ impl Pack {
             name_offsets,
             name_text,
             postcodes,
+            origins,
+            origin_names,
             numbers,
             numeric,
             places,
+            town_grid,
             by_locality,
             by_postcode,
             source,
@@ -311,6 +393,37 @@ impl Pack {
         &self.source
     }
 
+    /// Each dataset named when the pack was built, with how many records it supplied.
+    /// Empty when the pack names none.
+    pub fn datasets(&self) -> Vec<(&str, u64)> {
+        let mut counts = vec![0u64; self.origin_names.len() + 1];
+        for record in 0..self.origins.as_ref().len() / 2 {
+            if let Some(n) = counts.get_mut(usize::from(self.origin_at(record))) {
+                *n += 1;
+            }
+        }
+        self.origin_names
+            .iter()
+            .zip(&counts[1..])
+            .map(|(name, n)| (name.as_str(), *n))
+            .collect()
+    }
+
+    fn origin_at(&self, record: usize) -> u16 {
+        self.origins
+            .as_ref()
+            .get(record * 2..record * 2 + 2)
+            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    /// The dataset behind a record, falling back to the pack's source.
+    fn origin_name(&self, origin: u16) -> &str {
+        usize::from(origin)
+            .checked_sub(1)
+            .and_then(|i| self.origin_names.get(i))
+            .map_or(&self.source, String::as_str)
+    }
+
     /// Number of addresses in the pack.
     pub fn len(&self) -> usize {
         self.records.as_ref().len() / 16
@@ -327,10 +440,55 @@ impl Pack {
 
     /// Searches free text, as a person typed it.
     pub fn search(&self, text: &str) -> Outcome {
+        self.search_near(text, &Elsewhere::default())
+    }
+
+    fn has_towns(&self) -> bool {
+        !self.town_grid.is_empty()
+    }
+
+    fn reads_as_bare_town(&self, text: &str) -> bool {
+        matches!(parse(text, self), Parsed::Area { postcode, .. } if postcode.is_empty())
+    }
+
+    /// The closest town in this pack's town list.
+    fn nearest_town(&self, at: (f64, f64)) -> Option<&Place> {
+        let (cy, cx) = (town_cell(at.0), town_cell(at.1));
+        let mut best: Option<(f64, u32)> = None;
+        for ring in 0..=TOWN_CELLS {
+            for dy in -ring..=ring {
+                for dx in -ring..=ring {
+                    if dy.abs() != ring && dx.abs() != ring {
+                        continue;
+                    }
+                    for &i in self
+                        .town_grid
+                        .get(&(cy + dy, cx + dx))
+                        .into_iter()
+                        .flatten()
+                    {
+                        let t = &self.places[i as usize];
+                        let d = (t.lat - at.0).powi(2)
+                            + ((t.lon - at.1) * at.0.to_radians().cos()).powi(2);
+                        if best.is_none_or(|b| d < b.0) {
+                            best = Some((d, i));
+                        }
+                    }
+                }
+            }
+            // One ring past a hit covers anything nearer across a cell corner.
+            if best.is_some() && ring >= 1 {
+                break;
+            }
+        }
+        best.map(|b| &self.places[b.1 as usize])
+    }
+
+    fn search_near(&self, text: &str, elsewhere: &Elsewhere) -> Outcome {
         match parse(text, self) {
             Parsed::Postal => Outcome::Declined(Declined::PostalAddress),
             Parsed::Unknown => Outcome::Declined(Declined::Unreadable),
-            Parsed::Address(a) => self.finish(self.address(&a)),
+            Parsed::Address(a) => self.finish(self.address(&a, elsewhere)),
             Parsed::Area {
                 locality,
                 postcode,
@@ -356,7 +514,7 @@ impl Pack {
             region: q.region.to_uppercase(),
             confirmed: false,
         };
-        self.finish(self.address(&a))
+        self.finish(self.address(&a, &Elsewhere::default()))
     }
 
     fn finish(&self, found: Vec<Candidate>) -> Outcome {
@@ -382,9 +540,11 @@ impl Pack {
         if !exact.is_empty() {
             return exact;
         }
+        // No postcode isn't a postcode: every town without one would match.
         let coded: Vec<u32> = self
             .by_postcode
             .get(postcode)
+            .filter(|_| !postcode.is_empty())
             .map(|v| v.iter().copied().filter(in_region).collect())
             .unwrap_or_default();
         if !coded.is_empty() {
@@ -413,6 +573,7 @@ impl Pack {
                 postcode: postcode.to_string(),
                 region: String::new(),
                 place_confirmed: true,
+                source: self.source.clone(),
             }];
         }
         let mut ids = self.matching_places(locality, postcode, region);
@@ -469,6 +630,7 @@ impl Pack {
             postcode: p.postcode.clone(),
             region: p.region.clone(),
             place_confirmed: true,
+            source: self.source.clone(),
         }
     }
 
@@ -481,7 +643,7 @@ impl Pack {
         postcode: &str,
         region: &str,
         anchors: &[(f64, f64)],
-        strict: bool,
+        elsewhere: Option<&Elsewhere>,
     ) -> Vec<Hit> {
         let (start, end) = (
             Self::u32_at(&self.groups, group) as usize,
@@ -492,17 +654,28 @@ impl Pack {
         for i in start..end {
             let place = Self::u32_at(&self.records, i * 4 + 3);
             let p = &self.places[place as usize];
-            if !region.is_empty() && p.region != region {
+            // A record with no region can't disagree with the one asked for.
+            if !region.is_empty() && !p.region.is_empty() && p.region != region {
                 continue;
             }
             let lat = f64::from(Self::u32_at(&self.records, i * 4) as i32) / 1e7;
             let lon = f64::from(Self::u32_at(&self.records, i * 4 + 1) as i32) / 1e7;
-            let score = u8::from(!locality.is_empty() && p.name == locality) * 2
+            // Another pack's town list can say which town a record with no town is in. Being
+            // merely close won't do, as boroughs share street names.
+            let towns = elsewhere.filter(|e| !e.towns.is_empty());
+            let unnamed = p.name.is_empty() && !locality.is_empty();
+            let in_town = !locality.is_empty()
+                && (p.name == locality
+                    || (unnamed && towns.is_some_and(|e| e.is_nearest_town(locality, (lat, lon)))));
+            let score = u8::from(in_town) * 2
                 + u8::from(!postcode.is_empty() && p.postcode == postcode) * 2;
+            if unnamed && towns.is_some() && score == 0 {
+                continue;
+            }
             // Strict lookups skip the distance work: only the place asked for counts.
             if asked
                 && score == 0
-                && (strict
+                && (elsewhere.is_none()
                     || !anchors
                         .iter()
                         .any(|a| distance(*a, (lat, lon)) < NEARBY_METRES))
@@ -513,6 +686,7 @@ impl Pack {
                 place,
                 score,
                 number: Self::u32_at(&self.records, i * 4 + 2),
+                origin: self.origin_at(i),
                 lat,
                 lon,
             });
@@ -551,30 +725,61 @@ impl Pack {
         out
     }
 
-    fn address(&self, a: &Address) -> Vec<Candidate> {
-        let mut found = self.resolve(a);
+    /// Where a place is, for finding records close by. Postcodes can split a city into
+    /// thousands of places, so this keeps one position per grid cell.
+    fn anchors(&self, places: &[u32], others: &[(f64, f64)]) -> Vec<(f64, f64)> {
+        let mut seen = HashSet::new();
+        places
+            .iter()
+            .map(|id| (self.places[*id as usize].lat, self.places[*id as usize].lon))
+            .chain(others.iter().copied())
+            .filter(|p| seen.insert((town_cell(p.0), town_cell(p.1))))
+            .collect()
+    }
+
+    /// Positions of a town, biggest first.
+    fn town_points(&self, locality: &str, region: &str) -> Vec<(f64, f64)> {
+        let mut ids = self.matching_places(locality, "", region);
+        ids.sort_by_key(|id| std::cmp::Reverse(self.places[*id as usize].population));
+        ids.iter()
+            .take(MAX_TOWNS)
+            .map(|id| (self.places[*id as usize].lat, self.places[*id as usize].lon))
+            .collect()
+    }
+
+    fn address(&self, a: &Address, elsewhere: &Elsewhere) -> Vec<Candidate> {
+        let mut found = self.resolve(a, elsewhere);
         if !a.locality.is_empty() || !a.postcode.is_empty() {
             for c in &mut found {
+                // With a town list, a record with no town only gets here if it's in the
+                // town asked for.
                 c.place_confirmed = normalise_place(&c.locality, self.country) == a.locality
-                    || (!a.postcode.is_empty() && c.postcode == a.postcode);
+                    || (!a.postcode.is_empty() && c.postcode == a.postcode)
+                    || (a.postcode.is_empty()
+                        && c.locality.is_empty()
+                        && !elsewhere.towns.is_empty());
             }
         }
         found
     }
 
-    fn resolve(&self, a: &Address) -> Vec<Candidate> {
+    fn resolve(&self, a: &Address, elsewhere: &Elsewhere) -> Vec<Candidate> {
         let places = self.matching_places(&a.locality, &a.postcode, &a.region);
-        let anchors: Vec<(f64, f64)> = places
-            .iter()
-            .map(|id| (self.places[*id as usize].lat, self.places[*id as usize].lon))
-            .collect();
+        let anchors = self.anchors(&places, &elsewhere.anchors);
         let mut hits: Vec<(Hit, usize)> = Vec::new();
         let mut groups = self.exact_street(&a.street);
         for (index, (group, _)) in groups.iter().enumerate() {
             hits.extend(
-                self.hits(*group, &a.locality, &a.postcode, &a.region, &anchors, false)
-                    .into_iter()
-                    .map(|h| (h, index)),
+                self.hits(
+                    *group,
+                    &a.locality,
+                    &a.postcode,
+                    &a.region,
+                    &anchors,
+                    Some(elsewhere),
+                )
+                .into_iter()
+                .map(|h| (h, index)),
             );
         }
         // A real street with nothing in the right place may be a typo for one that has.
@@ -594,7 +799,7 @@ impl Pack {
                 tier = Some(distance);
                 // One guess at a time: a respelled street must be in the place asked for.
                 let confirmed = self
-                    .hits(*group, &a.locality, &a.postcode, &a.region, &anchors, true)
+                    .hits(*group, &a.locality, &a.postcode, &a.region, &anchors, None)
                     .into_iter()
                     .filter(|h| h.score > 0)
                     .map(|h| (h, index));
@@ -624,7 +829,10 @@ impl Pack {
                         street_name(*index),
                         tail(h.place)
                     );
-                    exact.push(self.candidate(h.place, (h.lat, h.lon), Precision::House, label));
+                    let mut found =
+                        self.candidate(h.place, (h.lat, h.lon), Precision::House, label);
+                    found.source = self.origin_name(h.origin).to_string();
+                    exact.push(found);
                 }
             }
             if !exact.is_empty() {
@@ -677,6 +885,7 @@ impl Pack {
                 postcode: a.postcode.clone(),
                 region: String::new(),
                 place_confirmed: true,
+                source: self.source.clone(),
             }];
         }
 
@@ -716,14 +925,20 @@ impl Pack {
         region: &str,
     ) -> Vec<Candidate> {
         let places = self.matching_places(locality, postcode, region);
-        let anchors: Vec<(f64, f64)> = places
-            .iter()
-            .map(|id| (self.places[*id as usize].lat, self.places[*id as usize].lon))
-            .collect();
+        let anchors = self.anchors(&places, &[]);
         let collect = |key: &str| -> Vec<Hit> {
             self.exact_street(key)
                 .into_iter()
-                .flat_map(|(g, _)| self.hits(g, locality, postcode, region, &anchors, false))
+                .flat_map(|(g, _)| {
+                    self.hits(
+                        g,
+                        locality,
+                        postcode,
+                        region,
+                        &anchors,
+                        Some(&Elsewhere::default()),
+                    )
+                })
                 .collect()
         };
         let (a, b) = (collect(first), collect(second));

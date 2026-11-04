@@ -9,8 +9,9 @@ use woopwoop::{gnaf, search_all, Country, Outcome, Pack, PackBuilder, Precision,
 
 const USAGE: &str = "usage:
   woopwoop build-gnaf <G-NAF Standard folder> <out.pack> [source label]
-  woopwoop build-tsv <tsv of: number, street, locality, postcode, region, lat, lon> <out.pack> <source label> <AU|US>
+  woopwoop build-tsv <tsv of: number, street, locality, postcode, region, lat, lon, optional dataset> <out.pack> <source label> <AU|US>
   woopwoop build-overture <addresses.tsv> <places.tsv> <roads.tsv> <out.pack> <source label> <AU|US|CA|NZ|GB>
+  woopwoop datasets <pack>
   woopwoop search <pack[,pack]> <address>
   woopwoop eval <pack[,pack]> <tsv of: text, lat, lon, optional group>";
 
@@ -132,21 +133,26 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             for line in std::io::BufReader::new(std::fs::File::open(tsv)?).lines() {
                 let line = line?;
                 let c: Vec<&str> = line.split('\t').map(|f| f.trim_matches('"')).collect();
-                let [number, street, locality, postcode, region, lat, lon] = c[..] else {
-                    continue;
+                let (number, street, locality, postcode, region, lat, lon, dataset) = match c[..] {
+                    [a, b, c, d, e, f, g] => (a, b, c, d, e, f, g, ""),
+                    [a, b, c, d, e, f, g, h] => (a, b, c, d, e, f, g, h),
+                    _ => continue,
                 };
                 let (Ok(lat), Ok(lon)) = (lat.parse(), lon.parse()) else {
                     continue;
                 };
-                builder.add(&Record {
-                    street: street.to_string(),
-                    number: number.to_string(),
-                    locality: locality.to_string(),
-                    postcode: postcode.to_string(),
-                    region: region.to_string(),
-                    lat,
-                    lon,
-                });
+                builder.add_from(
+                    &Record {
+                        street: street.to_string(),
+                        number: number.to_string(),
+                        locality: locality.to_string(),
+                        postcode: postcode.to_string(),
+                        region: region.to_string(),
+                        lat,
+                        lon,
+                    },
+                    dataset,
+                );
                 read += 1;
             }
             let kept = builder.finish(out)?;
@@ -184,21 +190,26 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             for line in open(addresses)? {
                 let line = line?;
                 let c: Vec<&str> = line.split('\t').map(|f| f.trim_matches('"')).collect();
-                let [number, street, locality, postcode, region, lat, lon] = c[..] else {
-                    continue;
+                let (number, street, locality, postcode, region, lat, lon, dataset) = match c[..] {
+                    [a, b, c, d, e, f, g] => (a, b, c, d, e, f, g, ""),
+                    [a, b, c, d, e, f, g, h] => (a, b, c, d, e, f, g, h),
+                    _ => continue,
                 };
                 let (Ok(lat), Ok(lon)) = (lat.parse(), lon.parse()) else {
                     continue;
                 };
-                builder.add(&Record {
-                    street: street.to_string(),
-                    number: number.to_string(),
-                    locality: locality.to_string(),
-                    postcode: postcode.to_string(),
-                    region: region.to_string(),
-                    lat,
-                    lon,
-                });
+                builder.add_from(
+                    &Record {
+                        street: street.to_string(),
+                        number: number.to_string(),
+                        locality: locality.to_string(),
+                        postcode: postcode.to_string(),
+                        region: region.to_string(),
+                        lat,
+                        lon,
+                    },
+                    dataset,
+                );
                 counts[1] += 1;
             }
             for line in open(roads)? {
@@ -228,6 +239,13 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     println!("{:?}  {:.6}, {:.6}  {}", c.precision, c.lat, c.lon, c.label)
                 }),
                 Outcome::Declined(why) => println!("declined: {why:?}"),
+            }
+        }
+        ["datasets", pack] => {
+            let pack = Pack::open(pack)?;
+            println!("{}: {} records", pack.source(), pack.len());
+            for (name, n) in pack.datasets() {
+                println!("{n}\t{name}");
             }
         }
         ["eval", pack, tsv] => eval(&open_packs(pack)?, tsv)?,
