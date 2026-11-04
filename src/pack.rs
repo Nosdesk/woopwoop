@@ -2,7 +2,7 @@
 //! loads only the small tables; addresses stay on disk until a lookup touches them.
 
 use crate::automaton::{edits, Fuzzy};
-use crate::normal::{normalise, title};
+use crate::normal::{normalise_for, normalise_place, title, Country};
 use crate::parse::{parse, Address, Gazetteer, Parsed};
 use fst::{IntoStreamer, Map, Streamer};
 use memmap2::Mmap;
@@ -19,6 +19,7 @@ pub(crate) const SECTIONS: usize = 6;
 const NEARBY_METRES: f64 = 12_000.0;
 const MAX_CANDIDATES: usize = 5;
 const MAX_FUZZY_STREETS: usize = 64;
+const MAX_FUZZY_SCAN: usize = 20_000;
 /// Interpolating across a wider gap than this is guesswork.
 const MAX_NUMBER_GAP: i64 = 60;
 
@@ -130,6 +131,7 @@ pub struct Pack {
     by_locality: HashMap<String, Vec<u32>>,
     by_postcode: HashMap<String, Vec<u32>>,
     source: String,
+    country: Country,
 }
 
 /// The nearest listed house on one side of a missing number.
@@ -228,9 +230,14 @@ impl Pack {
                 lon: lon.parse().map_err(|_| Error::Invalid("bad place row"))?,
             });
         }
-        let source = text(section(5)?)?
-            .lines()
-            .find_map(|l| l.strip_prefix("source=").map(str::to_string))
+        let meta = text(section(5)?)?;
+        let field = |name: &str| {
+            meta.lines()
+                .find_map(|l| l.strip_prefix(name).map(str::to_string))
+        };
+        let source = field("source=").unwrap_or_default();
+        let country = field("country=")
+            .and_then(|c| Country::from_code(&c))
             .unwrap_or_default();
         Ok(Self {
             streets,
@@ -242,6 +249,7 @@ impl Pack {
             by_locality,
             by_postcode,
             source,
+            country,
         })
     }
 
@@ -289,8 +297,8 @@ impl Pack {
     pub fn lookup(&self, q: &Query) -> Outcome {
         let a = Address {
             number: q.number.as_ref().map(|n| n.to_lowercase()),
-            street: normalise(&q.street),
-            locality: normalise(&q.locality),
+            street: normalise_for(&q.street, self.country),
+            locality: normalise_place(&q.locality, self.country),
             postcode: q.postcode.clone(),
             region: q.region.to_uppercase(),
             confirmed: false,
@@ -429,15 +437,18 @@ impl Pack {
         let automaton = Fuzzy::new(key, if length < 9 { 1 } else { 2 });
         let mut stream = self.streets.search(automaton).into_stream();
         let mut out = Vec::new();
+        // Gather widely before ranking: the stream is alphabetical, so stopping early
+        // would drop the closest spelling in a country with millions of streets.
         while let Some((k, g)) = stream.next() {
             if k != key.as_bytes() {
                 out.push((g as usize, String::from_utf8_lossy(k).into_owned()));
             }
-            if out.len() >= MAX_FUZZY_STREETS {
+            if out.len() >= MAX_FUZZY_SCAN {
                 break;
             }
         }
         out.sort_by_key(|(_, name)| edits(key, name));
+        out.truncate(MAX_FUZZY_STREETS);
         out
     }
 
@@ -445,7 +456,7 @@ impl Pack {
         let mut found = self.resolve(a);
         if !a.locality.is_empty() || !a.postcode.is_empty() {
             for c in &mut found {
-                c.place_confirmed = normalise(&c.locality) == a.locality
+                c.place_confirmed = normalise_place(&c.locality, self.country) == a.locality
                     || (!a.postcode.is_empty() && c.postcode == a.postcode);
             }
         }
@@ -638,5 +649,9 @@ impl Gazetteer for Pack {
 
     fn has_locality(&self, key: &str) -> bool {
         self.by_locality.contains_key(key)
+    }
+
+    fn country(&self) -> Country {
+        self.country
     }
 }

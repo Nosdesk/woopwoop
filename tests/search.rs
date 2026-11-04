@@ -280,6 +280,14 @@ fn postcode_rescues_a_wrong_suburb() {
 }
 
 #[test]
+fn an_unknown_suburb_does_not_undo_a_known_street() {
+    assert_eq!(
+        found("4 High St, Nowhereville 3181")[0].precision,
+        Precision::House
+    );
+}
+
+#[test]
 fn a_typo_in_the_street_is_forgiven() {
     let c = &found("7 Wattletere Rd, Malvern VIC 3144")[0];
     assert_eq!(

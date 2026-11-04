@@ -1,13 +1,15 @@
 //! Command line for building and checking packs.
 
 use std::collections::BTreeMap;
+use std::io::BufRead;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
-use woopwoop::{gnaf, Outcome, Pack, PackBuilder, Precision};
+use woopwoop::{gnaf, Country, Outcome, Pack, PackBuilder, Precision, Record};
 
 const USAGE: &str = "usage:
   woopwoop build-gnaf <G-NAF Standard folder> <out.pack> [source label]
+  woopwoop build-tsv <tsv of: number, street, locality, postcode, region, lat, lon> <out.pack> <source label> <AU|US>
   woopwoop search <pack> <address>
   woopwoop eval <pack> <tsv of: text, lat, lon, optional group>";
 
@@ -105,6 +107,38 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let started = Instant::now();
             let mut builder = PackBuilder::new(rest.first().copied().unwrap_or("G-NAF"));
             let read = gnaf::read(Path::new(dir), |r| builder.add(r))?;
+            let kept = builder.finish(out)?;
+            println!(
+                "read {read}, kept {kept}, {} MB, {:.1?}",
+                std::fs::metadata(out)?.len() / 1_000_000,
+                started.elapsed()
+            );
+        }
+        ["build-tsv", tsv, out, source, code] => {
+            let started = Instant::now();
+            let country = Country::from_code(code).ok_or("unknown country")?;
+            let mut builder = PackBuilder::for_country(source, country);
+            let mut read = 0u64;
+            for line in std::io::BufReader::new(std::fs::File::open(tsv)?).lines() {
+                let line = line?;
+                let c: Vec<&str> = line.split('\t').map(|f| f.trim_matches('"')).collect();
+                let [number, street, locality, postcode, region, lat, lon] = c[..] else {
+                    continue;
+                };
+                let (Ok(lat), Ok(lon)) = (lat.parse(), lon.parse()) else {
+                    continue;
+                };
+                builder.add(&Record {
+                    street: street.to_string(),
+                    number: number.to_string(),
+                    locality: locality.to_string(),
+                    postcode: postcode.to_string(),
+                    region: region.to_string(),
+                    lat,
+                    lon,
+                });
+                read += 1;
+            }
             let kept = builder.finish(out)?;
             println!(
                 "read {read}, kept {kept}, {} MB, {:.1?}",

@@ -1,6 +1,6 @@
 //! Building a pack. Run offline: it holds everything in memory, then writes one file.
 
-use crate::normal::{normalise, title};
+use crate::normal::{normalise_for, normalise_place, strip_place_prefix, title, Country};
 use crate::pack::{Error, MAGIC, SECTIONS, VERSION};
 use fst::MapBuilder;
 use std::collections::HashMap;
@@ -55,27 +55,34 @@ pub struct PackBuilder {
     display: Vec<String>,
     rows: Vec<Row>,
     source: String,
+    country: Country,
 }
 
 impl PackBuilder {
     /// `source` names the data and its version, and is stored in the pack.
     pub fn new(source: &str) -> Self {
+        Self::for_country(source, Country::Australia)
+    }
+
+    /// A builder for a country's address conventions.
+    pub fn for_country(source: &str, country: Country) -> Self {
         Self {
             source: source.to_string(),
+            country,
             ..Self::default()
         }
     }
 
     pub fn add(&mut self, r: &Record) {
-        let street = normalise(&r.street);
+        let street = normalise_for(&r.street, self.country);
         if street.is_empty() {
             return;
         }
-        let locality = normalise(&r.locality);
+        let locality = normalise_place(&r.locality, self.country);
         let key = format!("{locality}\t{}\t{}", r.postcode, r.region);
         let place = self.places.id(&key);
         if place as usize == self.display.len() {
-            self.display.push(title(&r.locality));
+            self.display.push(title(strip_place_prefix(&r.locality)));
         }
         self.rows.push(Row {
             street: self.streets.id(&street),
@@ -158,7 +165,12 @@ impl PackBuilder {
                 lo / n
             ));
         }
-        let meta = format!("source={}\naddresses={}\n", self.source, self.rows.len());
+        let meta = format!(
+            "source={}\ncountry={}\naddresses={}\n",
+            self.source,
+            self.country.code(),
+            self.rows.len()
+        );
 
         let sections: [&[u8]; SECTIONS] = [
             &fst,
