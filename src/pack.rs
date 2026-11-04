@@ -2,7 +2,7 @@
 //! loads only the small tables; addresses stay on disk until a lookup touches them.
 
 use crate::automaton::{edits, Fuzzy};
-use crate::normal::{normalise_for, normalise_place, title, Country};
+use crate::normal::{normalise_for, normalise_place, postcode_label, title, Country};
 use crate::parse::{parse, Address, Gazetteer, Parsed};
 use fst::{IntoStreamer, Map, Streamer};
 use memmap2::Mmap;
@@ -12,14 +12,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) const MAGIC: &[u8; 8] = b"WOOPWOOP";
-pub(crate) const VERSION: u32 = 3;
-pub(crate) const SECTIONS: usize = 8;
+pub(crate) const VERSION: u32 = 4;
+pub(crate) const SECTIONS: usize = 9;
 
 /// How far an unmatched suburb may be from where the query points and still count.
 const NEARBY_METRES: f64 = 12_000.0;
 const MAX_CANDIDATES: usize = 5;
 const MAX_FUZZY_STREETS: usize = 64;
-const MAX_FUZZY_SCAN: usize = 20_000;
+const MAX_FUZZY_SCAN: usize = 2_000;
 /// Interpolating across a wider gap than this is guesswork.
 const MAX_NUMBER_GAP: i64 = 60;
 
@@ -100,6 +100,33 @@ pub struct Query {
     pub region: String,
 }
 
+/// Searches several packs and returns the most precise answer, preferring earlier packs
+/// on a tie. Layering packs keeps sources with different licences in separate files,
+/// and improves a region by adding a pack.
+pub fn search_all(packs: &[Pack], text: &str) -> Outcome {
+    let mut best: Option<Outcome> = None;
+    let rank = |c: &[Candidate]| (!c[0].place_confirmed, c[0].precision);
+    for pack in packs {
+        if matches!(&best, Some(Outcome::Found(c)) if c[0].precision == Precision::House && c[0].place_confirmed)
+        {
+            break;
+        }
+        let outcome = pack.search(text);
+        best = Some(match (best.take(), outcome) {
+            (None, o) => o,
+            (Some(Outcome::Declined(Declined::PostalAddress)), _) => {
+                return Outcome::Declined(Declined::PostalAddress)
+            }
+            (Some(Outcome::Found(a)), Outcome::Found(b)) => {
+                Outcome::Found(if rank(&b) < rank(&a) { b } else { a })
+            }
+            (Some(Outcome::Found(a)), Outcome::Declined(_)) => Outcome::Found(a),
+            (Some(Outcome::Declined(_)), o) => o,
+        });
+    }
+    best.unwrap_or(Outcome::Declined(Declined::NotFound))
+}
+
 struct Slice {
     map: Arc<Mmap>,
     start: usize,
@@ -128,6 +155,7 @@ pub struct Pack {
     records: Slice,
     name_offsets: Slice,
     name_text: Slice,
+    postcodes: Map<Slice>,
     numbers: Vec<String>,
     numeric: Vec<i64>,
     places: Vec<Place>,
@@ -196,6 +224,7 @@ impl Pack {
         let groups = section(1)?;
         let name_offsets = section(6)?;
         let name_text = section(7)?;
+        let postcodes = Map::new(section(8)?).map_err(|_| Error::Invalid("bad postcode index"))?;
         let records = section(2)?;
         if records.as_ref().len() % 16 != 0 || groups.as_ref().len() % 4 != 0 {
             return Err(Error::Invalid("bad record table"));
@@ -253,6 +282,7 @@ impl Pack {
             records,
             name_offsets,
             name_text,
+            postcodes,
             numbers,
             numeric,
             places,
@@ -363,7 +393,28 @@ impl Pack {
         named
     }
 
+    /// A postcode's own position, if the pack has one.
+    fn postcode_point(&self, code: &str) -> Option<(f64, f64)> {
+        let packed = self.postcodes.get(code)?;
+        Some((
+            f64::from((packed >> 32) as u32 as i32) / 1e7,
+            f64::from(packed as u32 as i32) / 1e7,
+        ))
+    }
+
     fn area(&self, locality: &str, postcode: &str, region: &str) -> Vec<Candidate> {
+        if let Some(at) = self.postcode_point(postcode) {
+            return vec![Candidate {
+                lat: at.0,
+                lon: at.1,
+                precision: Precision::Locality,
+                label: postcode_label(postcode, self.country),
+                locality: String::new(),
+                postcode: postcode.to_string(),
+                region: String::new(),
+                place_confirmed: true,
+            }];
+        }
         let mut ids = self.matching_places(locality, postcode, region);
         // A town's official entry beats its per-postcode pieces, and the biggest town
         // of a name is the likeliest one.
@@ -379,16 +430,21 @@ impl Pack {
             .take(MAX_CANDIDATES)
             .map(|id| {
                 let p = &self.places[id as usize];
-                let parts = [p.display.as_str(), p.region.as_str(), p.postcode.as_str()];
-                let label = parts
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let label = self.place_label(p);
                 self.candidate(id, (p.lat, p.lon), Precision::Locality, label)
             })
             .collect()
+    }
+
+    fn place_label(&self, p: &Place) -> String {
+        let code = postcode_label(&p.postcode, self.country);
+        let parts = [p.display.as_str(), p.region.as_str(), code.as_str()];
+        parts
+            .iter()
+            .filter(|s| !s.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn candidate(
@@ -420,6 +476,7 @@ impl Pack {
         postcode: &str,
         region: &str,
         anchors: &[(f64, f64)],
+        strict: bool,
     ) -> Vec<Hit> {
         let (start, end) = (
             Self::u32_at(&self.groups, group) as usize,
@@ -437,11 +494,13 @@ impl Pack {
             let lon = f64::from(Self::u32_at(&self.records, i * 4 + 1) as i32) / 1e7;
             let score = u8::from(!locality.is_empty() && p.name == locality) * 2
                 + u8::from(!postcode.is_empty() && p.postcode == postcode) * 2;
+            // Strict lookups skip the distance work: only the place asked for counts.
             if asked
                 && score == 0
-                && !anchors
-                    .iter()
-                    .any(|a| distance(*a, (lat, lon)) < NEARBY_METRES)
+                && (strict
+                    || !anchors
+                        .iter()
+                        .any(|a| distance(*a, (lat, lon)) < NEARBY_METRES))
             {
                 continue;
             }
@@ -508,7 +567,7 @@ impl Pack {
         let mut groups = self.exact_street(&a.street);
         for (index, (group, _)) in groups.iter().enumerate() {
             hits.extend(
-                self.hits(*group, &a.locality, &a.postcode, &a.region, &anchors)
+                self.hits(*group, &a.locality, &a.postcode, &a.region, &anchors, false)
                     .into_iter()
                     .map(|h| (h, index)),
             );
@@ -530,7 +589,7 @@ impl Pack {
                 tier = Some(distance);
                 // One guess at a time: a respelled street must be in the place asked for.
                 let confirmed = self
-                    .hits(*group, &a.locality, &a.postcode, &a.region, &anchors)
+                    .hits(*group, &a.locality, &a.postcode, &a.region, &anchors, true)
                     .into_iter()
                     .filter(|h| h.score > 0)
                     .map(|h| (h, index));
@@ -545,7 +604,7 @@ impl Pack {
         let street_name = |index: usize| self.street_name(groups[index].0);
         let tail = |place: u32| {
             let p = &self.places[place as usize];
-            format!("{} {} {}", p.display, p.region, p.postcode)
+            self.place_label(p)
         };
 
         if let Some(number) = &a.number {
@@ -644,7 +703,7 @@ impl Pack {
         let collect = |key: &str| -> Vec<Hit> {
             self.exact_street(key)
                 .into_iter()
-                .flat_map(|(g, _)| self.hits(g, locality, postcode, region, &anchors))
+                .flat_map(|(g, _)| self.hits(g, locality, postcode, region, &anchors, false))
                 .collect()
         };
         let (a, b) = (collect(first), collect(second));
@@ -668,12 +727,10 @@ impl Pack {
                         .map_or_else(|| title(key), |g| self.street_name(g as usize))
                 };
                 let label = format!(
-                    "Corner of {} and {}, {} {} {}",
+                    "Corner of {} and {}, {}",
                     named(first),
                     named(second),
-                    p.display,
-                    p.region,
-                    p.postcode
+                    self.place_label(p)
                 );
                 vec![self.candidate(x.place, at, Precision::Street, label)]
             }

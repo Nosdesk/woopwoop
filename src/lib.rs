@@ -27,5 +27,5 @@ mod street_types;
 
 pub use build::{PackBuilder, Record};
 pub use normal::Country;
-pub use pack::{Candidate, Declined, Error, Outcome, Pack, Precision, Query};
+pub use pack::{search_all, Candidate, Declined, Error, Outcome, Pack, Precision, Query};
 pub use parse::{parse, Gazetteer, Parsed};

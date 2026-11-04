@@ -141,6 +141,124 @@ fn us_region(words: &[&str]) -> Option<(&'static str, usize)> {
     None
 }
 
+const CANADIAN_REGIONS: &[(&str, &str)] = &[
+    ("ALBERTA", "AB"),
+    ("BRITISH COLUMBIA", "BC"),
+    ("MANITOBA", "MB"),
+    ("NEW BRUNSWICK", "NB"),
+    ("NEWFOUNDLAND AND LABRADOR", "NL"),
+    ("NEWFOUNDLAND", "NL"),
+    ("NOVA SCOTIA", "NS"),
+    ("NORTHWEST TERRITORIES", "NT"),
+    ("NUNAVUT", "NU"),
+    ("ONTARIO", "ON"),
+    ("PRINCE EDWARD ISLAND", "PE"),
+    ("QUEBEC", "QC"),
+    ("QUÉBEC", "QC"),
+    ("SASKATCHEWAN", "SK"),
+    ("YUKON", "YT"),
+];
+
+fn canadian_region(words: &[&str]) -> Option<(&'static str, usize)> {
+    for n in (1..=4).rev() {
+        if words.len() < n {
+            continue;
+        }
+        let tail = words[words.len() - n..].join(" ");
+        if let Some((_, code)) = CANADIAN_REGIONS
+            .iter()
+            .find(|(name, code)| *name == tail || (n == 1 && *code == tail))
+        {
+            return Some((code, n));
+        }
+    }
+    (words.last() == Some(&"PQ")).then_some(("QC", 1))
+}
+
+fn strip_country_name(words: &mut Vec<&str>, country: Country) {
+    let names: &[&[&str]] = match country {
+        Country::UnitedStates => &[
+            &["UNITED", "STATES", "OF", "AMERICA"],
+            &["UNITED", "STATES"],
+            &["USA"],
+            &["US"],
+        ],
+        Country::Canada => &[&["CANADA"]],
+        Country::NewZealand => &[&["NEW", "ZEALAND"], &["AOTEAROA"], &["NZ"]],
+        Country::UnitedKingdom => &[
+            &["UNITED", "KINGDOM"],
+            &["GREAT", "BRITAIN"],
+            &["NORTHERN", "IRELAND"],
+            &["ENGLAND"],
+            &["SCOTLAND"],
+            &["WALES"],
+            &["UK"],
+            &["GB"],
+        ],
+        Country::Australia => &[],
+    };
+    if let Some(name) = names.iter().find(|n| words.ends_with(n)) {
+        words.truncate(words.len() - name.len());
+    }
+}
+
+fn pattern(word: &str, shape: &str) -> bool {
+    word.len() == shape.len()
+        && word.chars().zip(shape.chars()).all(|(c, s)| match s {
+            'A' => c.is_ascii_alphabetic(),
+            _ => c.is_ascii_digit(),
+        })
+}
+
+fn british_outward(word: &str) -> bool {
+    ["A9", "A99", "AA9", "AA99"]
+        .iter()
+        .any(|s| pattern(word, s))
+        || (word.len() >= 3
+            && word.len() <= 4
+            && word.is_ascii()
+            && (pattern(&word[..word.len() - 1], "A9") || pattern(&word[..word.len() - 1], "AA9"))
+            && word.ends_with(|c: char| c.is_ascii_alphabetic()))
+}
+
+/// Removes a postcode from the end, which can be one word or two.
+fn take_postcode(words: &mut Vec<&str>, country: Country) -> Option<String> {
+    let last = *words.last()?;
+    let before = words.len().checked_sub(2).map(|i| words[i]);
+    let (whole, split) = match country {
+        Country::Australia | Country::NewZealand => (is_postcode(last), false),
+        Country::UnitedStates => (is_us_zip(last), false),
+        Country::Canada => (
+            pattern(last, "A9A9A9"),
+            pattern(last, "9A9") && before.is_some_and(|w| pattern(w, "A9A")),
+        ),
+        Country::UnitedKingdom => {
+            let joined = last.len() >= 5
+                && last.is_ascii()
+                && pattern(&last[last.len() - 3..], "9AA")
+                && british_outward(&last[..last.len() - 3]);
+            (
+                joined,
+                pattern(last, "9AA") && before.is_some_and(british_outward),
+            )
+        }
+    };
+    if split {
+        words.pop();
+        let first = words.pop()?;
+        return Some(format!("{first}{last}"));
+    }
+    if !whole {
+        return None;
+    }
+    words.pop();
+    Some(if country == Country::UnitedStates {
+        last.chars().take(5).collect()
+    } else {
+        last.to_string()
+    })
+}
+
 fn is_us_zip(word: &str) -> bool {
     let (five, rest) = word.split_at(word.len().min(5));
     five.len() == 5
@@ -339,13 +457,11 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
     let country = g.country();
     let norm = |s: &str| normalise_for(s, country);
     let place = |s: &str| normalise_place(s, country);
-    let is_code = |w: &str| match country {
-        Country::Australia => is_postcode(w),
-        Country::UnitedStates => is_us_zip(w),
-    };
     let regions = |w: &[&str]| match country {
         Country::Australia => region_code(w),
         Country::UnitedStates => us_region(w),
+        Country::Canada => canadian_region(w),
+        Country::NewZealand | Country::UnitedKingdom => None,
     };
     let cleaned: String = text
         .to_uppercase()
@@ -374,20 +490,8 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
     {
         words.pop();
     }
-    if country == Country::UnitedStates {
-        if words.ends_with(&["UNITED", "STATES"]) {
-            words.truncate(words.len() - 2);
-        } else if matches!(words.last(), Some(&"USA") | Some(&"US")) {
-            words.pop();
-        }
-    }
-    let mut postcode = String::new();
-    if words.len() > 1 || words.last().is_some_and(|w| is_code(w)) {
-        if let Some(w) = words.last().filter(|w| is_code(w)) {
-            postcode = w.chars().take(5).collect();
-            words.pop();
-        }
-    }
+    strip_country_name(&mut words, country);
+    let mut postcode = take_postcode(&mut words, country).unwrap_or_default();
     let mut region = String::new();
     if let Some((code, n)) = regions(&words) {
         // "11 Bolton Ct 34758": Ct is the street's type here, not Connecticut.
@@ -402,10 +506,7 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
         }
     }
     if postcode.is_empty() {
-        if let Some(w) = words.last().filter(|w| is_code(w)) {
-            postcode = w.chars().take(5).collect();
-            words.pop();
-        }
+        postcode = take_postcode(&mut words, country).unwrap_or_default();
     }
     if words.is_empty() {
         return if postcode.is_empty() {
@@ -425,10 +526,21 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
     }
 
     let words = strip_units(&words);
-    let words = if country == Country::UnitedStates {
-        strip_trailing_units(&words)
-    } else {
-        words
+    let words = match country {
+        Country::UnitedStates => strip_trailing_units(&words),
+        // Canadians write the unit first: "12-345 Main St" is unit 12 at number 345.
+        Country::Canada => strip_trailing_units(&words)
+            .into_iter()
+            .map(|w| match w.split_once('-') {
+                Some((unit, number))
+                    if house_number(unit).is_some() && house_number(number).is_some() =>
+                {
+                    number
+                }
+                _ => w,
+            })
+            .collect(),
+        _ => words,
     };
     let mut best: Option<((u8, u8, usize), Address)> = None;
     for start in 0..words.len() {

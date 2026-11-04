@@ -315,3 +315,38 @@ fn po_boxes_are_declined() {
         Outcome::Declined(Declined::PostalAddress)
     );
 }
+
+#[test]
+fn layered_packs_give_the_most_precise_answer() {
+    let path = std::env::temp_dir().join(format!("woopwoop-layer-{}.pack", std::process::id()));
+    let mut b = PackBuilder::for_country("layer", Country::UnitedStates);
+    b.add(&record(
+        "4500",
+        "West Tropicana Avenue",
+        "Las Vegas",
+        "89103",
+        "NV",
+        36.10,
+        -115.21,
+    ));
+    b.finish(&path).expect("build");
+    let layer = Pack::open(&path).expect("open");
+    let _ = std::fs::remove_file(&path);
+    let base_path = std::env::temp_dir().join(format!("woopwoop-base-{}.pack", std::process::id()));
+    let mut b = PackBuilder::for_country("base", Country::UnitedStates);
+    b.add_place("Las Vegas", "NV", 36.17, -115.14, 641000);
+    b.add_road("West Tropicana Avenue", 36.10, -115.20);
+    b.finish(&base_path).expect("build");
+    let base = Pack::open(&base_path).expect("open");
+    let _ = std::fs::remove_file(&base_path);
+
+    let packs = [base, layer];
+    match woopwoop::search_all(&packs, "4500 W Tropicana Ave, Las Vegas, NV") {
+        Outcome::Found(c) => assert_eq!(c[0].precision, Precision::House),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        woopwoop::search_all(&packs, "PO Box 1, Las Vegas NV"),
+        Outcome::Declined(Declined::PostalAddress)
+    );
+}

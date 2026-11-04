@@ -8,6 +8,9 @@ pub enum Country {
     #[default]
     Australia,
     UnitedStates,
+    Canada,
+    NewZealand,
+    UnitedKingdom,
 }
 
 impl Country {
@@ -15,6 +18,9 @@ impl Country {
         match self {
             Self::Australia => "AU",
             Self::UnitedStates => "US",
+            Self::Canada => "CA",
+            Self::NewZealand => "NZ",
+            Self::UnitedKingdom => "GB",
         }
     }
 
@@ -22,6 +28,9 @@ impl Country {
         match code {
             "AU" => Some(Self::Australia),
             "US" => Some(Self::UnitedStates),
+            "CA" => Some(Self::Canada),
+            "NZ" => Some(Self::NewZealand),
+            "GB" => Some(Self::UnitedKingdom),
             _ => None,
         }
     }
@@ -101,6 +110,39 @@ fn route_words(words: &[&str]) -> Option<(&'static str, usize)> {
         ["highway" | "hwy", n, ..] if is_number(n) => Some(("hwy", 1)),
         ["interstate", n, ..] if is_number(n) => Some(("i", 1)),
         _ => None,
+    }
+}
+
+/// French accents, which Canadians often leave out: "Montréal" and "Montreal".
+fn unaccented(c: char) -> char {
+    match c {
+        'à' | 'â' | 'ä' => 'a',
+        'é' | 'è' | 'ê' | 'ë' => 'e',
+        'î' | 'ï' => 'i',
+        'ô' | 'ö' => 'o',
+        'ù' | 'û' | 'ü' => 'u',
+        'ç' => 'c',
+        other => other,
+    }
+}
+
+/// A postcode as packs store it: Canadian and British codes lose their space.
+pub fn postcode_key(code: &str, country: Country) -> String {
+    match country {
+        Country::Canada | Country::UnitedKingdom => {
+            code.split_whitespace().collect::<String>().to_uppercase()
+        }
+        _ => code.to_string(),
+    }
+}
+
+/// A stored postcode as people write it: "SW1A2AA" becomes "SW1A 2AA".
+pub fn postcode_label(code: &str, country: Country) -> String {
+    match country {
+        Country::Canada | Country::UnitedKingdom if code.len() > 3 && code.is_ascii() => {
+            format!("{} {}", &code[..code.len() - 3], &code[code.len() - 3..])
+        }
+        _ => code.to_string(),
     }
 }
 
@@ -230,12 +272,15 @@ pub fn normalise(text: &str) -> String {
 /// `normalise`, with the conventions of one country.
 pub fn normalise_for(text: &str, country: Country) -> String {
     let lower = text.to_lowercase();
+    let french = country == Country::Canada;
     let spaced: String = lower
         .chars()
+        .map(|c| if french { unaccented(c) } else { c })
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
     let words: Vec<&str> = spaced.split_whitespace().collect();
     let american = country == Country::UnitedStates;
+    let north_american = american || french;
     let mut end = words.len();
     // Trailing directions and route numbers aren't the type: "County Road 169 North".
     while end > 1 && (is_direction(words[end - 1]) || is_number(words[end - 1])) {
@@ -259,7 +304,7 @@ pub fn normalise_for(text: &str, country: Country) -> String {
         let leading = american && i == 0 && end > 2;
         if (i >= end || leading) && short_direction(word).is_some() {
             out.push_str(short_direction(word).unwrap_or(word));
-        } else if let Some(number) = ordinal(word).filter(|_| american) {
+        } else if let Some(number) = ordinal(word).filter(|_| north_american) {
             out.push_str(&number);
         } else {
             out.push_str(match word {
@@ -267,7 +312,7 @@ pub fn normalise_for(text: &str, country: Country) -> String {
                 "saint" => "st",
                 w if i + 1 == end => street_type(w).unwrap_or(w),
                 // "39th Street Circle East": American names can hold a type mid-way.
-                w if american && i > 0 && is_common_type(w) => street_type(w).unwrap_or(w),
+                w if north_american && i > 0 && is_common_type(w) => street_type(w).unwrap_or(w),
                 w => w,
             });
         }
