@@ -1,7 +1,7 @@
 //! Command line for building and checking packs.
 
 use std::collections::BTreeMap;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -243,9 +243,16 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         ["datasets", pack] => {
             let pack = Pack::open(pack)?;
-            println!("{}: {} records", pack.source(), pack.len());
+            let mut out = std::io::stdout().lock();
+            let mut list = writeln!(out, "{}: {} records", pack.source(), pack.len());
             for (name, n) in pack.datasets() {
-                println!("{n}\t{name}");
+                list = list.and_then(|()| writeln!(out, "{n}\t{name}"));
+            }
+            // A reader like `head` closing the pipe early isn't a failure.
+            if let Err(e) = list {
+                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(e.into());
+                }
             }
         }
         ["eval", pack, tsv] => eval(&open_packs(pack)?, tsv)?,

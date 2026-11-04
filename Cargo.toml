@@ -1,6 +1,6 @@
 [package]
 name = "woopwoop"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "A small, fast address geocoder. Finds anywhere, even out in woop woop."
 license = "Apache-2.0"

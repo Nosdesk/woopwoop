@@ -169,6 +169,56 @@ fn a_town_alone_comes_from_the_town_list() {
 }
 
 #[test]
+fn a_house_with_no_town_shows_the_town_from_another_pack() {
+    let (addresses, map) = (path("label.pack"), path("label-towns.pack"));
+    let mut b = PackBuilder::new("addresses");
+    b.add(&record("9", "Quiet Lane", "", "3999", -36.01));
+    b.finish(&addresses).unwrap();
+    let mut b = PackBuilder::new("towns");
+    b.add_place("Ghost Town", "VIC", -36.0, 145.0, 10);
+    b.finish(&map).unwrap();
+    let packs = [Pack::open(&addresses).unwrap(), Pack::open(&map).unwrap()];
+
+    for text in ["9 Quiet Lane, Ghost Town VIC", "9 Quiet Lane, VIC 3999"] {
+        let found = top(&packs, text);
+        assert_eq!(found.locality, "Ghost Town", "{text}");
+        assert_eq!(found.label, "9 Quiet Lane, Ghost Town VIC 3999", "{text}");
+    }
+    let alone = [Pack::open(&addresses).unwrap()];
+    assert_eq!(
+        top(&alone, "9 Quiet Lane, VIC 3999").label,
+        "9 Quiet Lane, VIC 3999"
+    );
+    std::fs::remove_file(&addresses).ok();
+    std::fs::remove_file(&map).ok();
+}
+
+#[test]
+fn a_town_in_another_pack_marks_where_a_street_ends() {
+    let (addresses, map) = (path("ends.pack"), path("ends-towns.pack"));
+    let mut b = PackBuilder::new("addresses");
+    b.add(&record("7500", "County Road 100 West", "", "", -36.01));
+    b.add(&record(
+        "7500",
+        "County Road 100",
+        "Elsewhere",
+        "3888",
+        -30.0,
+    ));
+    b.finish(&addresses).unwrap();
+    let mut b = PackBuilder::new("towns");
+    b.add_place("Walesboro", "VIC", -36.0, 145.0, 10);
+    b.finish(&map).unwrap();
+    let packs = [Pack::open(&addresses).unwrap(), Pack::open(&map).unwrap()];
+    let found = top(&packs, "7500 County Road 100 West Walesboro VIC");
+
+    assert_eq!(found.precision, Precision::House);
+    assert!((found.lat + 36.01).abs() < 0.001, "{found:?}");
+    std::fs::remove_file(&addresses).ok();
+    std::fs::remove_file(&map).ok();
+}
+
+#[test]
 fn separate_packs_fill_each_others_gaps_at_search_time() {
     let (addresses, map) = (path("addresses.pack"), path("map.pack"));
     let mut b = PackBuilder::new("addresses");

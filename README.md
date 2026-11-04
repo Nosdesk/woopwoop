@@ -75,11 +75,11 @@ Building takes under a minute for most countries, and about four minutes with 6 
 | New Zealand | 98.8% | 0.1% | 7 of 8 |
 | Canada | 99.0% | 0.4% | 13 of 13 |
 | United Kingdom | 98.4% | 0.5% | 12 of 12 |
-| United States | 92.8% | 2.7% | 25 of 28 |
+| United States | 92.3% | 3.0% | 25 of 28 |
 
 These scores come from addresses in the same data as the pack, with generated formats. They show how well WoopWoop reads addresses. They can't show how accurate the data is or what's missing, so they don't compare countries fairly.
 
-These samples only hold addresses that name their town. About 4% of American addresses don't, including all of New York City, and they do worse: searched by town with no ZIP, 70% land within 50 m. Their labels show no town.
+These samples only hold addresses that name their town. About 4% of American addresses don't, including all of New York City, and they do a little worse: searched by town with no ZIP, 83% land within 50 m. They need a pack of towns beside them, and their labels show the nearest town.
 
 Coverage varies. The UK pack holds 5.1 million addresses out of roughly 30 million. American data falls about 29 million addresses short, unevenly: New Hampshire and Hawaii have none in Overture, and Nevada and Georgia are far from complete. An OpenStreetMap layer helps, and the rest resolve to the street or town.
 

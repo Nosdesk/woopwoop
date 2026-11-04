@@ -154,19 +154,21 @@ struct Elsewhere<'a> {
 
 impl<'a> Elsewhere<'a> {
     fn for_search(packs: &'a [Pack], pack: &Pack, text: &str) -> Self {
-        let Parsed::Address(a) = parse(text, pack) else {
-            return Self::default();
-        };
-        if a.locality.is_empty() {
-            return Self::default();
-        }
         let others = || packs.iter().filter(|p| !std::ptr::eq(*p, pack));
-        Self {
-            anchors: others()
+        let towns: Vec<&Pack> = others().filter(|p| p.has_towns()).collect();
+        let anchors = match parse(
+            text,
+            &WithTowns {
+                pack,
+                towns: &towns,
+            },
+        ) {
+            Parsed::Address(a) if !a.locality.is_empty() => others()
                 .flat_map(|p| p.town_points(&a.locality, &a.region))
                 .collect(),
-            towns: others().filter(|p| p.has_towns()).collect(),
-        }
+            _ => Vec::new(),
+        };
+        Self { anchors, towns }
     }
 
     /// Whether `locality` is the nearest town to a position.
@@ -174,6 +176,31 @@ impl<'a> Elsewhere<'a> {
         self.towns
             .iter()
             .any(|p| p.nearest_town(at).is_some_and(|t| t.name == locality))
+    }
+
+    fn nearest_town(&self, at: (f64, f64)) -> Option<&'a Place> {
+        self.towns.iter().find_map(|p| p.nearest_town(at))
+    }
+}
+
+/// A pack read alongside other packs' towns, so the parser can tell where a street ends
+/// and a town it doesn't hold begins.
+struct WithTowns<'a> {
+    pack: &'a Pack,
+    towns: &'a [&'a Pack],
+}
+
+impl Gazetteer for WithTowns<'_> {
+    fn has_street(&self, key: &str) -> bool {
+        self.pack.has_street(key)
+    }
+
+    fn has_locality(&self, key: &str) -> bool {
+        self.pack.has_locality(key) || self.towns.iter().any(|p| p.has_locality(key))
+    }
+
+    fn country(&self) -> Country {
+        self.pack.country()
     }
 }
 
@@ -485,7 +512,11 @@ impl Pack {
     }
 
     fn search_near(&self, text: &str, elsewhere: &Elsewhere) -> Outcome {
-        match parse(text, self) {
+        let reader = WithTowns {
+            pack: self,
+            towns: &elsewhere.towns,
+        };
+        match parse(text, &reader) {
             Parsed::Postal => Outcome::Declined(Declined::PostalAddress),
             Parsed::Unknown => Outcome::Declined(Declined::Unreadable),
             Parsed::Address(a) => self.finish(self.address(&a, elsewhere)),
@@ -598,13 +629,17 @@ impl Pack {
     }
 
     fn place_label(&self, p: &Place) -> String {
-        let code = postcode_label(&p.postcode, self.country);
+        self.label_of(&p.display, &p.region, &p.postcode)
+    }
+
+    fn label_of(&self, town: &str, region: &str, postcode: &str) -> String {
+        let code = postcode_label(postcode, self.country);
         // British and New Zealand addresses don't name a region.
         let region = match self.country {
             Country::UnitedKingdom | Country::NewZealand => "",
-            _ => p.region.as_str(),
+            _ => region,
         };
-        let parts = [p.display.as_str(), region, code.as_str()];
+        let parts = [town, region, code.as_str()];
         parts
             .iter()
             .filter(|s| !s.is_empty())
@@ -760,7 +795,28 @@ impl Pack {
                         && !elsewhere.towns.is_empty());
             }
         }
+        for c in &mut found {
+            self.name_town(c, elsewhere);
+        }
         found
+    }
+
+    /// Fills in the town of a record with none, for showing. Nothing here is stored.
+    fn name_town(&self, c: &mut Candidate, elsewhere: &Elsewhere) {
+        if !c.locality.is_empty() || c.precision == Precision::Locality {
+            return;
+        }
+        let Some(town) = elsewhere.nearest_town((c.lat, c.lon)) else {
+            return;
+        };
+        if c.region.is_empty() {
+            c.region.clone_from(&town.region);
+        }
+        c.locality.clone_from(&town.display);
+        let tail = self.label_of(&town.display, &c.region, &c.postcode);
+        if let Some((head, _)) = c.label.rsplit_once(", ") {
+            c.label = format!("{head}, {tail}");
+        }
     }
 
     fn resolve(&self, a: &Address, elsewhere: &Elsewhere) -> Vec<Candidate> {
