@@ -122,6 +122,10 @@ fn house_number(token: &str) -> Option<String> {
     Some(first.to_lowercase())
 }
 
+fn is_postcode(word: &str) -> bool {
+    word.len() == 4 && word.chars().all(|c| c.is_ascii_digit())
+}
+
 fn is_type(token: &str) -> bool {
     street_type(&token.to_lowercase()).is_some()
 }
@@ -235,9 +239,8 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
     {
         words.pop();
     }
-    let is_postcode = |w: &&str| w.len() == 4 && w.chars().all(|c| c.is_ascii_digit());
     let mut postcode = String::new();
-    if words.len() > 1 || words.last().is_some_and(&is_postcode) {
+    if words.len() > 1 || words.last().is_some_and(|w| is_postcode(w)) {
         if let Some(w) = words.last().filter(|w| is_postcode(w)) {
             postcode = (*w).to_string();
             words.pop();
