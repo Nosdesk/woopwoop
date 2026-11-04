@@ -10,6 +10,7 @@ use woopwoop::{gnaf, Country, Outcome, Pack, PackBuilder, Precision, Record};
 const USAGE: &str = "usage:
   woopwoop build-gnaf <G-NAF Standard folder> <out.pack> [source label]
   woopwoop build-tsv <tsv of: number, street, locality, postcode, region, lat, lon> <out.pack> <source label> <AU|US>
+  woopwoop build-overture <addresses.tsv> <places.tsv> <roads.tsv> <out.pack> <source label> <AU|US>
   woopwoop search <pack> <address>
   woopwoop eval <pack> <tsv of: text, lat, lon, optional group>";
 
@@ -143,6 +144,68 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "read {read}, kept {kept}, {} MB, {:.1?}",
                 std::fs::metadata(out)?.len() / 1_000_000,
+                started.elapsed()
+            );
+        }
+        ["build-overture", addresses, places, roads, out, source, code] => {
+            let started = Instant::now();
+            let country = Country::from_code(code).ok_or("unknown country")?;
+            let mut builder = PackBuilder::for_country(source, country);
+            let open = |path: &str| -> std::io::Result<_> {
+                Ok(std::io::BufReader::new(std::fs::File::open(path)?).lines())
+            };
+            let mut counts = [0u64; 3];
+            for line in open(places)? {
+                let line = line?;
+                let c: Vec<&str> = line.split('\t').map(|f| f.trim_matches('"')).collect();
+                let [name, _, region, subtype, population, lat, lon] = c[..] else {
+                    continue;
+                };
+                let (Ok(lat), Ok(lon)) = (lat.parse(), lon.parse()) else {
+                    continue;
+                };
+                if subtype == "locality" {
+                    builder.add_place(name, region, lat, lon, population.parse().unwrap_or(0));
+                    counts[0] += 1;
+                }
+            }
+            for line in open(addresses)? {
+                let line = line?;
+                let c: Vec<&str> = line.split('\t').map(|f| f.trim_matches('"')).collect();
+                let [number, street, locality, postcode, region, lat, lon] = c[..] else {
+                    continue;
+                };
+                let (Ok(lat), Ok(lon)) = (lat.parse(), lon.parse()) else {
+                    continue;
+                };
+                builder.add(&Record {
+                    street: street.to_string(),
+                    number: number.to_string(),
+                    locality: locality.to_string(),
+                    postcode: postcode.to_string(),
+                    region: region.to_string(),
+                    lat,
+                    lon,
+                });
+                counts[1] += 1;
+            }
+            for line in open(roads)? {
+                let line = line?;
+                let c: Vec<&str> = line.split('\t').map(|f| f.trim_matches('"')).collect();
+                let [name, lat, lon] = c[..] else { continue };
+                let (Ok(lat), Ok(lon)) = (lat.parse(), lon.parse()) else {
+                    continue;
+                };
+                builder.add_road(name, lat, lon);
+                counts[2] += 1;
+            }
+            let kept = builder.finish(out)?;
+            let size = std::fs::metadata(out)?.len() / 1_000_000;
+            println!(
+                "places {}, addresses {}, roads {}, kept {kept}, {size} MB, {:.1?}",
+                counts[0],
+                counts[1],
+                counts[2],
                 started.elapsed()
             );
         }

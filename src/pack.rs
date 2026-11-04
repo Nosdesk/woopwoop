@@ -12,8 +12,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) const MAGIC: &[u8; 8] = b"WOOPWOOP";
-pub(crate) const VERSION: u32 = 1;
-pub(crate) const SECTIONS: usize = 6;
+pub(crate) const VERSION: u32 = 3;
+pub(crate) const SECTIONS: usize = 8;
 
 /// How far an unmatched suburb may be from where the query points and still count.
 const NEARBY_METRES: f64 = 12_000.0;
@@ -119,12 +119,15 @@ struct Place {
     region: String,
     lat: f64,
     lon: f64,
+    population: u64,
 }
 
 pub struct Pack {
     streets: Map<Slice>,
     groups: Slice,
     records: Slice,
+    name_offsets: Slice,
+    name_text: Slice,
     numbers: Vec<String>,
     numeric: Vec<i64>,
     places: Vec<Place>,
@@ -191,6 +194,8 @@ impl Pack {
         };
         let streets = Map::new(section(0)?).map_err(|_| Error::Invalid("bad street index"))?;
         let groups = section(1)?;
+        let name_offsets = section(6)?;
+        let name_text = section(7)?;
         let records = section(2)?;
         if records.as_ref().len() % 16 != 0 || groups.as_ref().len() % 4 != 0 {
             return Err(Error::Invalid("bad record table"));
@@ -212,7 +217,7 @@ impl Pack {
         ) = Default::default();
         for line in text(section(4)?)?.lines() {
             let c: Vec<&str> = line.split('\t').collect();
-            let [name, postcode, region, display, lat, lon] = c[..] else {
+            let [name, postcode, region, display, lat, lon, population] = c[..] else {
                 return Err(Error::Invalid("bad place row"));
             };
             let id = places.len() as u32;
@@ -228,6 +233,9 @@ impl Pack {
                 region: region.to_string(),
                 lat: lat.parse().map_err(|_| Error::Invalid("bad place row"))?,
                 lon: lon.parse().map_err(|_| Error::Invalid("bad place row"))?,
+                population: population
+                    .parse()
+                    .map_err(|_| Error::Invalid("bad place row"))?,
             });
         }
         let meta = text(section(5)?)?;
@@ -243,6 +251,8 @@ impl Pack {
             streets,
             groups,
             records,
+            name_offsets,
+            name_text,
             numbers,
             numeric,
             places,
@@ -251,6 +261,19 @@ impl Pack {
             source,
             country,
         })
+    }
+
+    /// A street as its data wrote it.
+    fn street_name(&self, group: usize) -> String {
+        let (start, end) = (
+            Self::u32_at(&self.name_offsets, group) as usize,
+            Self::u32_at(&self.name_offsets, group + 1) as usize,
+        );
+        self.name_text
+            .as_ref()
+            .get(start..end)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default()
     }
 
     /// The data this pack was built from.
@@ -341,17 +364,29 @@ impl Pack {
     }
 
     fn area(&self, locality: &str, postcode: &str, region: &str) -> Vec<Candidate> {
-        self.matching_places(locality, postcode, region)
-            .into_iter()
+        let mut ids = self.matching_places(locality, postcode, region);
+        // A town's official entry beats its per-postcode pieces, and the biggest town
+        // of a name is the likeliest one.
+        if postcode.is_empty()
+            && ids
+                .iter()
+                .any(|id| self.places[*id as usize].postcode.is_empty())
+        {
+            ids.retain(|id| self.places[*id as usize].postcode.is_empty());
+        }
+        ids.sort_by_key(|id| std::cmp::Reverse(self.places[*id as usize].population));
+        ids.into_iter()
             .take(MAX_CANDIDATES)
             .map(|id| {
                 let p = &self.places[id as usize];
-                self.candidate(
-                    id,
-                    (p.lat, p.lon),
-                    Precision::Locality,
-                    format!("{} {} {}", p.display, p.region, p.postcode),
-                )
+                let parts = [p.display.as_str(), p.region.as_str(), p.postcode.as_str()];
+                let label = parts
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.candidate(id, (p.lat, p.lon), Precision::Locality, label)
             })
             .collect()
     }
@@ -507,7 +542,7 @@ impl Pack {
             return self.area(&a.locality, &a.postcode, &a.region);
         };
         let top: Vec<&(Hit, usize)> = hits.iter().filter(|h| h.0.score == best).collect();
-        let street_name = |index: usize| title(&groups[index].1);
+        let street_name = |index: usize| self.street_name(groups[index].0);
         let tail = |place: u32| {
             let p = &self.places[place as usize];
             format!("{} {} {}", p.display, p.region, p.postcode)
@@ -627,10 +662,15 @@ impl Pack {
             Some((d, x, y)) if d < 500.0 => {
                 let at = ((x.lat + y.lat) / 2.0, (x.lon + y.lon) / 2.0);
                 let p = &self.places[x.place as usize];
+                let named = |key: &str| {
+                    self.streets
+                        .get(key)
+                        .map_or_else(|| title(key), |g| self.street_name(g as usize))
+                };
                 let label = format!(
                     "Corner of {} and {}, {} {} {}",
-                    title(first),
-                    title(second),
+                    named(first),
+                    named(second),
                     p.display,
                     p.region,
                     p.postcode

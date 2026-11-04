@@ -5,7 +5,9 @@
 //! the parser tries each split and asks the gazetteer which streets and localities
 //! exist.
 
-use crate::normal::{corrected_type, normalise_for, normalise_place, street_type, Country};
+use crate::normal::{
+    corrected_keyword, corrected_type, normalise_for, normalise_place, street_type, Country,
+};
 
 /// What the parser may ask of the data it's parsing against.
 pub trait Gazetteer {
@@ -484,7 +486,17 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
             .or(typed)
             .or((!postcode.is_empty() && last >= start + 2).then_some(last));
         if let Some(end) = end {
-            let mut street = norm(&words[start + 1..end].join(" "));
+            let spelled: Vec<String> = words[start + 1..end]
+                .iter()
+                .map(|w| {
+                    let lower = w.to_lowercase();
+                    let fixed = (country == Country::UnitedStates)
+                        .then(|| corrected_keyword(&lower))
+                        .flatten();
+                    fixed.map_or(lower, str::to_string)
+                })
+                .collect();
+            let mut street = norm(&spelled.join(" "));
             let tail = street.rsplit(' ').next().unwrap_or("").to_string();
             if let Some(fixed) = (street_type(&tail).is_none())
                 .then(|| corrected_type(&tail))

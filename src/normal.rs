@@ -36,10 +36,76 @@ pub fn street_type(word: &str) -> Option<&'static str> {
 }
 
 fn is_direction(word: &str) -> bool {
-    matches!(
-        word,
-        "n" | "s" | "e" | "w" | "north" | "south" | "east" | "west"
-    )
+    short_direction(word).is_some()
+}
+
+fn short_direction(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "north" | "n" => "n",
+        "south" | "s" => "s",
+        "east" | "e" => "e",
+        "west" | "w" => "w",
+        "northwest" | "nw" => "nw",
+        "northeast" | "ne" => "ne",
+        "southwest" | "sw" => "sw",
+        "southeast" | "se" => "se",
+        _ => return None,
+    })
+}
+
+/// "Fifth" and "5th" both become "5", as American data uses all of "5", "5th" and "Fifth".
+fn ordinal(word: &str) -> Option<String> {
+    const WORDS: &[&str] = &[
+        "first",
+        "second",
+        "third",
+        "fourth",
+        "fifth",
+        "sixth",
+        "seventh",
+        "eighth",
+        "ninth",
+        "tenth",
+        "eleventh",
+        "twelfth",
+        "thirteenth",
+        "fourteenth",
+        "fifteenth",
+        "sixteenth",
+        "seventeenth",
+        "eighteenth",
+        "nineteenth",
+        "twentieth",
+    ];
+    if let Some(i) = WORDS.iter().position(|w| *w == word) {
+        return Some((i + 1).to_string());
+    }
+    let digits = word.chars().take_while(char::is_ascii_digit).count();
+    (digits > 0 && matches!(&word[digits..], "st" | "nd" | "rd" | "th"))
+        .then(|| word[..digits].to_string())
+}
+
+/// American route names have several spellings: "FM 2725" is "Farm to Market Road 2725".
+fn route_words(words: &[&str]) -> Option<(&'static str, usize)> {
+    match words {
+        ["farm", "to", "market", "road" | "rd", n, ..] if is_number(n) => Some(("fm", 4)),
+        ["farm", "to", "market", n, ..] if is_number(n) => Some(("fm", 3)),
+        ["ranch", "road" | "rd", n, ..] if is_number(n) => Some(("rr", 2)),
+        ["county", "road" | "rd" | "route" | "highway" | "hwy", n, ..] if is_number(n) => {
+            Some(("cr", 2))
+        }
+        ["state", "road" | "rd" | "route" | "highway" | "hwy", n, ..] if is_number(n) => {
+            Some(("sr", 2))
+        }
+        ["us", "highway" | "hwy" | "route" | "rte", n, ..] if is_number(n) => Some(("us", 2)),
+        ["highway" | "hwy", n, ..] if is_number(n) => Some(("hwy", 1)),
+        ["interstate", n, ..] if is_number(n) => Some(("i", 1)),
+        _ => None,
+    }
+}
+
+fn is_number(word: &str) -> bool {
+    !word.is_empty() && word.chars().all(|c| c.is_ascii_digit())
 }
 
 fn is_common_type(word: &str) -> bool {
@@ -100,6 +166,32 @@ pub(crate) fn corrected_type(word: &str) -> Option<&'static str> {
         .and_then(|t| street_type(t))
 }
 
+/// Corrects a misspelled word that normalising would otherwise lose: "Coutny Road 702"
+/// has to read "County" before it can become "CR 702".
+pub(crate) fn corrected_keyword(word: &str) -> Option<&'static str> {
+    const WORDS: &[&str] = &[
+        "county",
+        "north",
+        "south",
+        "east",
+        "west",
+        "northeast",
+        "northwest",
+        "southeast",
+        "southwest",
+        "state",
+        "highway",
+        "market",
+    ];
+    if word.len() < 4 {
+        return None;
+    }
+    WORDS
+        .iter()
+        .find(|w| **w != word && crate::automaton::edits(word, w) == 1)
+        .copied()
+}
+
 /// Normalises a suburb or city, dropping the official prefix: people type "El Paso"
 /// for "City of El Paso".
 pub fn normalise_place(text: &str, country: Country) -> String {
@@ -143,35 +235,43 @@ pub fn normalise_for(text: &str, country: Country) -> String {
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
     let words: Vec<&str> = spaced.split_whitespace().collect();
+    let american = country == Country::UnitedStates;
     let mut end = words.len();
     // Trailing directions and route numbers aren't the type: "County Road 169 North".
-    while end > 1
-        && (is_direction(words[end - 1]) || words[end - 1].chars().all(|c| c.is_ascii_digit()))
-    {
+    while end > 1 && (is_direction(words[end - 1]) || is_number(words[end - 1])) {
         end -= 1;
     }
-    // American streets lead with a direction: "South Main Street", "S Main St".
-    let leading = |i: usize| country == Country::UnitedStates && i == 0 && end > 2;
     let mut out = String::with_capacity(spaced.len());
-    for (i, word) in words.iter().enumerate() {
-        if i > 0 {
+    let mut i = 0;
+    while i < words.len() {
+        if !out.is_empty() {
             out.push(' ');
         }
-        let canonical = match *word {
-            "mt" => "mount",
-            "saint" => "st",
-            w if i + 1 == end => street_type(w).unwrap_or(w),
-            // "39th Street Circle East": American names can hold a type mid-way.
-            w if country == Country::UnitedStates && i > 0 && is_common_type(w) => {
-                street_type(w).unwrap_or(w)
+        if american {
+            if let Some((short, used)) = route_words(&words[i..]) {
+                out.push_str(short);
+                i += used;
+                continue;
             }
-            "north" if i >= end || leading(i) => "n",
-            "south" if i >= end || leading(i) => "s",
-            "east" if i >= end || leading(i) => "e",
-            "west" if i >= end || leading(i) => "w",
-            w => w,
-        };
-        out.push_str(canonical);
+        }
+        let word = words[i];
+        // American streets lead with a direction: "South Main Street", "S Main St".
+        let leading = american && i == 0 && end > 2;
+        if (i >= end || leading) && short_direction(word).is_some() {
+            out.push_str(short_direction(word).unwrap_or(word));
+        } else if let Some(number) = ordinal(word).filter(|_| american) {
+            out.push_str(&number);
+        } else {
+            out.push_str(match word {
+                "mt" => "mount",
+                "saint" => "st",
+                w if i + 1 == end => street_type(w).unwrap_or(w),
+                // "39th Street Circle East": American names can hold a type mid-way.
+                w if american && i > 0 && is_common_type(w) => street_type(w).unwrap_or(w),
+                w => w,
+            });
+        }
+        i += 1;
     }
     out
 }
@@ -232,6 +332,21 @@ mod tests {
             normalise_for("39th Street Circle East", Country::UnitedStates),
             normalise_for("39th St Cir E", Country::UnitedStates)
         );
+    }
+
+    #[test]
+    fn american_numbers_and_routes_have_one_spelling() {
+        let us = |t| normalise_for(t, Country::UnitedStates);
+        assert_eq!(us("Fifth Avenue"), us("5th Ave"));
+        assert_eq!(us("5 Avenue"), us("5th Ave"));
+        assert_eq!(us("West 34th Street"), us("W 34 St"));
+        assert_eq!(
+            us("Pennsylvania Avenue Northwest"),
+            us("Pennsylvania Ave NW")
+        );
+        assert_eq!(us("Farm to Market Road 2725"), us("FM 2725"));
+        assert_eq!(us("County Road 26"), us("CR 26"));
+        assert_eq!(us("State Route 110"), us("SR 110"));
     }
 
     #[test]

@@ -127,6 +127,19 @@ fn pack() -> &'static Pack {
             28.2,
             -81.5,
         ));
+        b.add_place("Las Vegas", "NV", 36.17, -115.14, 641000);
+        b.add_place("Las Vegas", "NM", 35.59, -105.22, 13000);
+        b.add_place("Reno", "NV", 39.53, -119.81, 264000);
+        b.add_road("West Tropicana Avenue", 36.10, -115.20);
+        b.add(&record(
+            "9",
+            "Sahara Avenue",
+            "",
+            "89102",
+            "NV",
+            36.15,
+            -115.16,
+        ));
         let path = std::env::temp_dir().join(format!("woopwoop-usa-{}.pack", std::process::id()));
         b.finish(&path).expect("build");
         let p = Pack::open(&path).expect("open");
@@ -219,6 +232,75 @@ fn a_street_that_exists_elsewhere_does_not_swallow_a_typo() {
 fn ct_can_be_a_court_as_well_as_connecticut() {
     let c = &found("11 Bolton Ct, 34758")[0];
     assert_eq!((c.precision, c.region.as_str()), (Precision::House, "FL"));
+}
+
+#[test]
+fn an_official_town_needs_no_addresses() {
+    let c = &found("Las Vegas, NV")[0];
+    assert_eq!(
+        (c.precision, c.locality.as_str()),
+        (Precision::Locality, "Las Vegas")
+    );
+    assert!((c.lat - 36.17).abs() < 0.01);
+}
+
+#[test]
+fn the_bigger_town_comes_first() {
+    assert_eq!(found("Las Vegas")[0].region, "NV");
+}
+
+#[test]
+fn a_road_with_no_addresses_still_resolves_to_the_street() {
+    let c = &found("4500 W Tropicana Ave, Las Vegas, NV")[0];
+    assert_eq!(c.precision, Precision::Street);
+    assert!((c.lat - 36.10).abs() < 0.01);
+}
+
+#[test]
+fn an_address_with_no_town_takes_the_nearest() {
+    assert_eq!(
+        found("9 Sahara Ave, Las Vegas, NV")[0].precision,
+        Precision::House
+    );
+}
+
+#[test]
+fn every_spelling_of_fifth_avenue_works() {
+    for text in [
+        "350 5th Ave, New York, NY",
+        "350 Fifth Avenue, New York, NY",
+        "350 5 Ave, New York, NY",
+    ] {
+        assert_eq!(found(text)[0].precision, Precision::House, "{text}");
+    }
+}
+
+#[test]
+fn a_full_compass_point_matches_its_initials() {
+    assert_eq!(
+        found("1600 Pennsylvania Ave NW, Washington, DC")[0].precision,
+        Precision::House
+    );
+}
+
+#[test]
+fn labels_use_the_street_as_written() {
+    assert_eq!(
+        found("350 5th Ave, New York, NY")[0].label,
+        "350 Fifth Avenue, New York NY 10118"
+    );
+}
+
+#[test]
+fn a_typo_in_a_route_word_is_forgiven() {
+    assert_eq!(
+        found("18563 Coutny Road 26, Tyler, TX 75707")[0].precision,
+        Precision::House
+    );
+    assert_eq!(
+        found("42050 Suoth Sasabe Hwy, Sasabe AZ 85633")[0].precision,
+        Precision::House
+    );
 }
 
 #[test]

@@ -188,7 +188,7 @@ fn finds_a_plain_address() {
     assert_eq!(c.precision, Precision::House);
     assert_eq!(c.locality, "Windsor");
     assert!((c.lat - -37.8504).abs() < 1e-6);
-    assert_eq!(c.label, "4 High St, Windsor VIC 3181");
+    assert_eq!(c.label, "4 High Street, Windsor VIC 3181");
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn numbers_on_the_other_side_of_the_road_are_not_used() {
 fn a_street_with_no_number_points_at_the_street() {
     let c = &found("High St, Windsor")[0];
     assert_eq!(c.precision, Precision::Street);
-    assert_eq!(c.label, "High St, Windsor VIC 3181");
+    assert_eq!(c.label, "High Street, Windsor VIC 3181");
 }
 
 #[test]
