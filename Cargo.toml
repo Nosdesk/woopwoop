@@ -1,0 +1,19 @@
+[package]
+name = "woopwoop"
+version = "0.1.0"
+edition = "2021"
+description = "A small, fast address geocoder. Finds anywhere, even out in woop woop."
+license = "Apache-2.0"
+repository = "https://github.com/Nosdesk/woopwoop"
+keywords = ["geocoding", "address", "gnaf", "geocoder", "maps"]
+categories = ["science::geo"]
+readme = "README.md"
+exclude = ["docs/", ".github/", "eval/*.tsv", "*.pack"]
+
+[dependencies]
+fst = "0.4"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
