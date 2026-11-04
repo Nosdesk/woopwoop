@@ -407,7 +407,7 @@ impl Pack {
             return vec![Candidate {
                 lat: at.0,
                 lon: at.1,
-                precision: Precision::Locality,
+                precision: Precision::Street,
                 label: postcode_label(postcode, self.country),
                 locality: String::new(),
                 postcode: postcode.to_string(),
@@ -438,7 +438,12 @@ impl Pack {
 
     fn place_label(&self, p: &Place) -> String {
         let code = postcode_label(&p.postcode, self.country);
-        let parts = [p.display.as_str(), p.region.as_str(), code.as_str()];
+        // British and New Zealand addresses don't name a region.
+        let region = match self.country {
+            Country::UnitedKingdom | Country::NewZealand => "",
+            _ => p.region.as_str(),
+        };
+        let parts = [p.display.as_str(), region, code.as_str()];
         parts
             .iter()
             .filter(|s| !s.is_empty())
@@ -658,6 +663,21 @@ impl Pack {
                     }
                 }
             }
+        }
+
+        // A postcode with its own position is far tighter than the middle of a street.
+        if let Some(at) = self.postcode_point(&a.postcode) {
+            let code = postcode_label(&a.postcode, self.country);
+            return vec![Candidate {
+                lat: at.0,
+                lon: at.1,
+                precision: Precision::Street,
+                label: format!("{}, {code}", street_name(top[0].1)),
+                locality: String::new(),
+                postcode: a.postcode.clone(),
+                region: String::new(),
+                place_confirmed: true,
+            }];
         }
 
         // The street exists but the house doesn't: point at the street, in each place.
