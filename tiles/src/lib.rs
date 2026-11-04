@@ -8,6 +8,7 @@
 
 mod labels;
 mod mvt;
+pub mod pmtiles;
 mod svg;
 mod theme;
 #[cfg(target_arch = "wasm32")]

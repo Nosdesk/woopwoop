@@ -14,8 +14,10 @@ use std::collections::HashMap;
 const SIZE: f64 = 2048.0;
 /// The same name closer than this is a repeat.
 const NEAR: f64 = SIZE * 0.9;
-/// Tiles of candidates kept between requests.
-const MEMORY: usize = 400;
+/// Tiles of candidates kept between requests. Each label image needs nine, and a
+/// dense city tile can hold thousands of candidates, so this stays small enough for
+/// a 128 MB Worker.
+const MEMORY: usize = 36;
 
 #[derive(Clone)]
 struct Candidate {

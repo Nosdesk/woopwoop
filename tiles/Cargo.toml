@@ -10,3 +10,6 @@ categories = ["science::geo", "wasm"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+miniz_oxide = "0.8"
