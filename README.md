@@ -55,6 +55,10 @@ cargo run --release -- build-overture us.tsv us-places.tsv us-roads.tsv us.pack 
 
 Australia builds in about a minute with 1 GB of memory, and America in about four minutes with 6 GB.
 
+## Maps
+
+[`woopwoop-tiles`](tiles) is a second crate in this repository. It turns vector map tiles into SVG, so a browser can draw a map from plain images. It reads PMTiles archives, and runs natively or from a small WebAssembly module.
+
 ## Accuracy
 
 | Fresh test addresses, written 10 to 12 ways | Australia | United States |

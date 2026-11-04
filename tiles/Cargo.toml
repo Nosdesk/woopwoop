@@ -1,0 +1,16 @@
+[package]
+name = "woopwoop-tiles"
+version = "0.1.0"
+edition = "2021"
+description = "Turns vector map tiles into SVG, so a browser can draw them as plain images."
+license = "Apache-2.0"
+repository = "https://github.com/Nosdesk/woopwoop"
+keywords = ["maps", "tiles", "svg", "mvt", "pmtiles"]
+categories = ["science::geo", "wasm"]
+readme = "README.md"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+miniz_oxide = "0.8"
