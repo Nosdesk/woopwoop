@@ -8,7 +8,7 @@ repository = "https://github.com/Nosdesk/woopwoop"
 keywords = ["geocoding", "address", "gnaf", "geocoder", "maps"]
 categories = ["science::geo"]
 readme = "README.md"
-exclude = ["docs/", ".github/", "eval/*.tsv", "*.pack"]
+exclude = ["docs/", ".github/", "eval/*.tsv", "*.pack", "tiles/"]
 
 [dependencies]
 fst = "0.4"
@@ -17,3 +17,13 @@ memmap2 = "0.9"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[workspace]
+members = ["tiles"]
+
+[profile.wasm]
+inherits = "release"
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
