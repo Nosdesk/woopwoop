@@ -1,6 +1,6 @@
 //! Building a pack. Run offline: it holds everything in memory, then writes one file.
 
-use crate::normal::{normalise, title};
+use crate::normal::{normalise_for, normalise_place, strip_place_prefix, title, Country};
 use crate::pack::{Error, MAGIC, SECTIONS, VERSION};
 use fst::MapBuilder;
 use std::collections::HashMap;
@@ -38,6 +38,29 @@ impl Interner {
     }
 }
 
+/// Grid size for finding the nearest town, in degrees.
+const CELL: f64 = 0.1;
+/// How many cells out to look. A record further than this from any town stays unplaced.
+const SEARCH_CELLS: i32 = 6;
+
+/// An official town or suburb.
+struct Town {
+    name: String,
+    region: String,
+    lat: f64,
+    lon: f64,
+}
+
+/// A record waiting for its nearest town.
+struct Unplaced {
+    street: u32,
+    number: u32,
+    postcode: u32,
+    region: u32,
+    lat: i32,
+    lon: i32,
+}
+
 struct Row {
     street: u32,
     place: u32,
@@ -55,39 +78,169 @@ pub struct PackBuilder {
     display: Vec<String>,
     rows: Vec<Row>,
     source: String,
+    country: Country,
+    towns: Vec<Town>,
+    /// Official positions and populations, by place id.
+    official: HashMap<u32, (f64, f64, u64)>,
+    unplaced: Vec<Unplaced>,
+    labels: Interner,
+    /// Each street as written, by street id.
+    street_names: Vec<String>,
 }
 
 impl PackBuilder {
     /// `source` names the data and its version, and is stored in the pack.
     pub fn new(source: &str) -> Self {
+        Self::for_country(source, Country::Australia)
+    }
+
+    /// A builder for a country's address conventions.
+    pub fn for_country(source: &str, country: Country) -> Self {
         Self {
             source: source.to_string(),
+            country,
             ..Self::default()
         }
     }
 
+    /// Adds an official town or suburb, which makes it searchable and gives it its
+    /// proper position, whether or not any address names it.
+    pub fn add_place(&mut self, name: &str, region: &str, lat: f64, lon: f64, population: u64) {
+        let locality = normalise_place(name, self.country);
+        if locality.is_empty() {
+            return;
+        }
+        let id = self.place_id(&locality, name, "", region);
+        let e = self.official.entry(id).or_insert((lat, lon, population));
+        // Two places can share a key; the bigger one is the one people mean.
+        if population >= e.2 {
+            *e = (lat, lon, population);
+        }
+        self.towns.push(Town {
+            name: name.to_string(),
+            region: region.to_string(),
+            lat,
+            lon,
+        });
+    }
+
+    fn place_id(&mut self, locality: &str, display: &str, postcode: &str, region: &str) -> u32 {
+        let key = format!("{locality}\t{postcode}\t{region}");
+        let place = self.places.id(&key);
+        if place as usize == self.display.len() {
+            self.display.push(title(strip_place_prefix(display)));
+        }
+        place
+    }
+
+    /// Adds a named road with no addresses, so a search can still reach the street.
+    pub fn add_road(&mut self, name: &str, lat: f64, lon: f64) {
+        self.add(&Record {
+            street: name.to_string(),
+            number: String::new(),
+            locality: String::new(),
+            postcode: String::new(),
+            region: String::new(),
+            lat,
+            lon,
+        });
+    }
+
     pub fn add(&mut self, r: &Record) {
-        let street = normalise(&r.street);
+        let street = normalise_for(&r.street, self.country);
         if street.is_empty() {
             return;
         }
-        let locality = normalise(&r.locality);
-        let key = format!("{locality}\t{}\t{}", r.postcode, r.region);
-        let place = self.places.id(&key);
-        if place as usize == self.display.len() {
-            self.display.push(title(&r.locality));
+        let street = self.streets.id(&street);
+        if street as usize == self.street_names.len() {
+            self.street_names.push(title(&r.street));
         }
+        let number = self.numbers.id(&r.number.to_lowercase());
+        let (lat, lon) = ((r.lat * 1e7).round() as i32, (r.lon * 1e7).round() as i32);
+        let locality = normalise_place(&r.locality, self.country);
+        if locality.is_empty() {
+            // Placed at the end, once every town is known.
+            let (postcode, region) = (self.labels.id(&r.postcode), self.labels.id(&r.region));
+            self.unplaced.push(Unplaced {
+                street,
+                number,
+                postcode,
+                region,
+                lat,
+                lon,
+            });
+            return;
+        }
+        let place = self.place_id(&locality, &r.locality, &r.postcode, &r.region);
         self.rows.push(Row {
-            street: self.streets.id(&street),
+            street,
             place,
-            number: self.numbers.id(&r.number.to_lowercase()),
-            lat: (r.lat * 1e7).round() as i32,
-            lon: (r.lon * 1e7).round() as i32,
+            number,
+            lat,
+            lon,
         });
+    }
+
+    /// Gives each record with no town the nearest one. This approximates a boundary
+    /// lookup, so it can pick the neighbouring town near an edge.
+    fn place_the_unplaced(&mut self) {
+        let towns = std::mem::take(&mut self.towns);
+        let cell = |v: f64| (v / CELL).floor() as i32;
+        let mut grid: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+        for (i, t) in towns.iter().enumerate() {
+            grid.entry((cell(t.lat), cell(t.lon)))
+                .or_default()
+                .push(i as u32);
+        }
+        for u in std::mem::take(&mut self.unplaced) {
+            let (lat, lon) = (f64::from(u.lat) / 1e7, f64::from(u.lon) / 1e7);
+            let (cy, cx) = (cell(lat), cell(lon));
+            let mut best: Option<(f64, u32)> = None;
+            for ring in 0..=SEARCH_CELLS {
+                for dy in -ring..=ring {
+                    for dx in -ring..=ring {
+                        if dy.abs() != ring && dx.abs() != ring {
+                            continue;
+                        }
+                        for &i in grid.get(&(cy + dy, cx + dx)).into_iter().flatten() {
+                            let t = &towns[i as usize];
+                            let d = (t.lat - lat).powi(2)
+                                + ((t.lon - lon) * lat.to_radians().cos()).powi(2);
+                            if best.is_none_or(|b| d < b.0) {
+                                best = Some((d, i));
+                            }
+                        }
+                    }
+                }
+                // One ring past a hit covers anything nearer across a cell corner.
+                if best.is_some() && ring >= 1 {
+                    break;
+                }
+            }
+            let postcode = self.labels.list[u.postcode as usize].clone();
+            let given = self.labels.list[u.region as usize].clone();
+            let (name, region) = match best {
+                Some((_, i)) => (
+                    towns[i as usize].name.clone(),
+                    towns[i as usize].region.clone(),
+                ),
+                None => (String::new(), given),
+            };
+            let locality = normalise_place(&name, self.country);
+            let place = self.place_id(&locality, &name, &postcode, &region);
+            self.rows.push(Row {
+                street: u.street,
+                place,
+                number: u.number,
+                lat: u.lat,
+                lon: u.lon,
+            });
+        }
     }
 
     /// Writes the pack and returns the number of addresses kept.
     pub fn finish(mut self, path: impl AsRef<Path>) -> Result<usize, Error> {
+        self.place_the_unplaced();
         // Street ids become ranks in sorted key order, as the FST requires.
         let mut order: Vec<u32> = (0..self.streets.list.len() as u32).collect();
         order.sort_unstable_by(|a, b| {
@@ -146,19 +299,35 @@ impl PackBuilder {
         }
         groups.extend_from_slice(&(self.rows.len() as u32).to_le_bytes());
 
+        let mut name_offsets = Vec::with_capacity((order.len() + 1) * 4);
+        let mut name_text = Vec::new();
+        for id in &order {
+            name_offsets.extend_from_slice(&(name_text.len() as u32).to_le_bytes());
+            name_text.extend_from_slice(self.street_names[*id as usize].as_bytes());
+        }
+        name_offsets.extend_from_slice(&(name_text.len() as u32).to_le_bytes());
+
         let number_text = numbers.join("\n").into_bytes();
         let mut places = String::new();
         for (i, key) in self.places.list.iter().enumerate() {
             let (la, lo, n) = sums[i];
             let n = f64::from(n.max(1));
+            let (lat, lon, population) =
+                self.official
+                    .get(&(i as u32))
+                    .copied()
+                    .unwrap_or((la / n, lo / n, 0));
             places.push_str(&format!(
-                "{key}\t{}\t{:.7}\t{:.7}\n",
-                self.display[i],
-                la / n,
-                lo / n
+                "{key}\t{}\t{lat:.7}\t{lon:.7}\t{population}\n",
+                self.display[i]
             ));
         }
-        let meta = format!("source={}\naddresses={}\n", self.source, self.rows.len());
+        let meta = format!(
+            "source={}\ncountry={}\naddresses={}\n",
+            self.source,
+            self.country.code(),
+            self.rows.len()
+        );
 
         let sections: [&[u8]; SECTIONS] = [
             &fst,
@@ -167,6 +336,8 @@ impl PackBuilder {
             &number_text,
             places.as_bytes(),
             meta.as_bytes(),
+            &name_offsets,
+            &name_text,
         ];
         let mut out = BufWriter::new(File::create(path)?);
         out.write_all(MAGIC)?;

@@ -5,12 +5,18 @@
 //! the parser tries each split and asks the gazetteer which streets and localities
 //! exist.
 
-use crate::normal::{normalise, street_type};
+use crate::normal::{
+    corrected_keyword, corrected_type, normalise_for, normalise_place, street_type, Country,
+};
 
 /// What the parser may ask of the data it's parsing against.
 pub trait Gazetteer {
     fn has_street(&self, key: &str) -> bool;
     fn has_locality(&self, key: &str) -> bool;
+    /// Whose address conventions to read by.
+    fn country(&self) -> Country {
+        Country::Australia
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -64,6 +70,123 @@ const UNIT_WORDS: &[&str] = &[
     "G",
 ];
 const DIRECTIONS: &[&str] = &["NORTH", "SOUTH", "EAST", "WEST", "N", "S", "E", "W"];
+
+const US_STATES: &[(&str, &str)] = &[
+    ("ALABAMA", "AL"),
+    ("ALASKA", "AK"),
+    ("ARIZONA", "AZ"),
+    ("ARKANSAS", "AR"),
+    ("CALIFORNIA", "CA"),
+    ("COLORADO", "CO"),
+    ("CONNECTICUT", "CT"),
+    ("DELAWARE", "DE"),
+    ("DISTRICT OF COLUMBIA", "DC"),
+    ("FLORIDA", "FL"),
+    ("GEORGIA", "GA"),
+    ("HAWAII", "HI"),
+    ("IDAHO", "ID"),
+    ("ILLINOIS", "IL"),
+    ("INDIANA", "IN"),
+    ("IOWA", "IA"),
+    ("KANSAS", "KS"),
+    ("KENTUCKY", "KY"),
+    ("LOUISIANA", "LA"),
+    ("MAINE", "ME"),
+    ("MARYLAND", "MD"),
+    ("MASSACHUSETTS", "MA"),
+    ("MICHIGAN", "MI"),
+    ("MINNESOTA", "MN"),
+    ("MISSISSIPPI", "MS"),
+    ("MISSOURI", "MO"),
+    ("MONTANA", "MT"),
+    ("NEBRASKA", "NE"),
+    ("NEVADA", "NV"),
+    ("NEW HAMPSHIRE", "NH"),
+    ("NEW JERSEY", "NJ"),
+    ("NEW MEXICO", "NM"),
+    ("NEW YORK", "NY"),
+    ("NORTH CAROLINA", "NC"),
+    ("NORTH DAKOTA", "ND"),
+    ("OHIO", "OH"),
+    ("OKLAHOMA", "OK"),
+    ("OREGON", "OR"),
+    ("PENNSYLVANIA", "PA"),
+    ("RHODE ISLAND", "RI"),
+    ("SOUTH CAROLINA", "SC"),
+    ("SOUTH DAKOTA", "SD"),
+    ("TENNESSEE", "TN"),
+    ("TEXAS", "TX"),
+    ("UTAH", "UT"),
+    ("VERMONT", "VT"),
+    ("VIRGINIA", "VA"),
+    ("WASHINGTON", "WA"),
+    ("WEST VIRGINIA", "WV"),
+    ("WISCONSIN", "WI"),
+    ("WYOMING", "WY"),
+];
+
+fn us_region(words: &[&str]) -> Option<(&'static str, usize)> {
+    for n in (1..=3).rev() {
+        if words.len() < n {
+            continue;
+        }
+        let tail = words[words.len() - n..].join(" ");
+        if let Some((_, code)) = US_STATES
+            .iter()
+            .find(|(name, code)| *name == tail || (n == 1 && *code == tail))
+        {
+            return Some((code, n));
+        }
+    }
+    None
+}
+
+fn is_us_zip(word: &str) -> bool {
+    let (five, rest) = word.split_at(word.len().min(5));
+    five.len() == 5
+        && five.chars().all(|c| c.is_ascii_digit())
+        && (rest.is_empty()
+            || (rest.len() == 5
+                && rest.starts_with('-')
+                && rest[1..].chars().all(|c| c.is_ascii_digit())))
+}
+
+/// American units follow the street: "123 Main St Apt 4B", "Suite 200", "#12".
+fn strip_trailing_units<'a>(words: &[&'a str]) -> Vec<&'a str> {
+    const WORDS: &[&str] = &[
+        "APT",
+        "APARTMENT",
+        "UNIT",
+        "STE",
+        "SUITE",
+        "FL",
+        "FLOOR",
+        "BLDG",
+        "BUILDING",
+        "RM",
+        "ROOM",
+        "LOT",
+        "TRLR",
+        "SPC",
+        "DEPT",
+    ];
+    let mut out = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        if w.starts_with('#') {
+            i += if w.len() == 1 { 2 } else { 1 };
+            continue;
+        }
+        if WORDS.contains(&w) && i + 1 < words.len() && i > 0 {
+            i += 2;
+            continue;
+        }
+        out.push(w);
+        i += 1;
+    }
+    out
+}
 
 fn region_code(words: &[&str]) -> Option<(&'static str, usize)> {
     let tail = |n: usize| (words.len() >= n).then(|| words[words.len() - n..].join(" "));
@@ -170,7 +293,7 @@ fn strip_units<'a>(words: &[&'a str]) -> Vec<&'a str> {
 }
 
 fn known_street(g: &dyn Gazetteer, words: &[&str]) -> Option<String> {
-    let key = normalise(&words.join(" "));
+    let key = normalise_for(&words.join(" "), g.country());
     if g.has_street(&key) {
         return Some(key);
     }
@@ -194,7 +317,7 @@ fn parse_corner(words: &[&str], g: &dyn Gazetteer, postcode: &str, region: &str)
         return Parsed::Unknown;
     };
     for end in (1..=right.len()).rev() {
-        let locality = normalise(&right[end..].join(" "));
+        let locality = normalise_place(&right[end..].join(" "), g.country());
         if !locality.is_empty() && !g.has_locality(&locality) {
             continue;
         }
@@ -213,6 +336,17 @@ fn parse_corner(words: &[&str], g: &dyn Gazetteer, postcode: &str, region: &str)
 
 /// Parses free text. Never fails: anything it can't read comes back as `Unknown`.
 pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
+    let country = g.country();
+    let norm = |s: &str| normalise_for(s, country);
+    let place = |s: &str| normalise_place(s, country);
+    let is_code = |w: &str| match country {
+        Country::Australia => is_postcode(w),
+        Country::UnitedStates => is_us_zip(w),
+    };
+    let regions = |w: &[&str]| match country {
+        Country::Australia => region_code(w),
+        Country::UnitedStates => us_region(w),
+    };
     let cleaned: String = text
         .to_uppercase()
         .chars()
@@ -234,26 +368,42 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
     }
     let mut words: Vec<&str> = joined.split_whitespace().collect();
 
-    if words.last() == Some(&"AUSTRALIA")
+    if country == Country::Australia
+        && words.last() == Some(&"AUSTRALIA")
         && !matches!(words.iter().rev().nth(1), Some(&"SOUTH") | Some(&"WESTERN"))
     {
         words.pop();
     }
+    if country == Country::UnitedStates {
+        if words.ends_with(&["UNITED", "STATES"]) {
+            words.truncate(words.len() - 2);
+        } else if matches!(words.last(), Some(&"USA") | Some(&"US")) {
+            words.pop();
+        }
+    }
     let mut postcode = String::new();
-    if words.len() > 1 || words.last().is_some_and(|w| is_postcode(w)) {
-        if let Some(w) = words.last().filter(|w| is_postcode(w)) {
-            postcode = (*w).to_string();
+    if words.len() > 1 || words.last().is_some_and(|w| is_code(w)) {
+        if let Some(w) = words.last().filter(|w| is_code(w)) {
+            postcode = w.chars().take(5).collect();
             words.pop();
         }
     }
     let mut region = String::new();
-    if let Some((code, n)) = region_code(&words) {
-        region = code.to_string();
-        words.truncate(words.len() - n);
+    if let Some((code, n)) = regions(&words) {
+        // "11 Bolton Ct 34758": Ct is the street's type here, not Connecticut.
+        let street_ends_here = country == Country::UnitedStates
+            && n == 1
+            && words.len() > 2
+            && is_type(words[words.len() - 1])
+            && g.has_street(&norm(&words[1..].join(" ")));
+        if !street_ends_here {
+            region = code.to_string();
+            words.truncate(words.len() - n);
+        }
     }
     if postcode.is_empty() {
-        if let Some(w) = words.last().filter(|w| is_postcode(w)) {
-            postcode = (*w).to_string();
+        if let Some(w) = words.last().filter(|w| is_code(w)) {
+            postcode = w.chars().take(5).collect();
             words.pop();
         }
     }
@@ -275,17 +425,22 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
     }
 
     let words = strip_units(&words);
+    let words = if country == Country::UnitedStates {
+        strip_trailing_units(&words)
+    } else {
+        words
+    };
     let mut best: Option<((u8, u8, usize), Address)> = None;
     for start in 0..words.len() {
         let Some(number) = house_number(words[start]) else {
             continue;
         };
         for end in start + 2..=words.len() {
-            let street = normalise(&words[start + 1..end].join(" "));
+            let street = norm(&words[start + 1..end].join(" "));
             if !g.has_street(&street) {
                 continue;
             }
-            let locality = normalise(&words[end..].join(" "));
+            let locality = place(&words[end..].join(" "));
             let score = u8::from(g.has_locality(&locality)) * 4
                 + u8::from(locality.is_empty())
                 + u8::from(!postcode.is_empty());
@@ -304,31 +459,56 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
             }
         }
     }
-    if let Some((_, a)) = best {
-        return Parsed::Address(a);
+    // A street that exists, followed by words that aren't a place, is a weak reading:
+    // "1304 Idaho Steret, Baytown" isn't a street called Idaho. It only gives way when
+    // a known place further along says where the street really ends.
+    let place_follows = |start: usize| {
+        (start + 2..words.len()).any(|e| g.has_locality(&place(&words[e..].join(" "))))
+    };
+    let weak = best
+        .as_ref()
+        .is_some_and(|(_, a)| !a.locality.is_empty() && !g.has_locality(&a.locality));
+    let first_number = words.iter().position(|w| house_number(w).is_some());
+    if !(weak && first_number.is_some_and(place_follows)) {
+        if let Some((_, a)) = best {
+            return Parsed::Address(a);
+        }
     }
 
     // No exact street: take the likeliest split, and let fuzzy matching check it.
     if let Some(start) = words.iter().position(|w| house_number(w).is_some()) {
-        let mut ends: Vec<usize> = (start + 2..=words.len())
-            .filter(|&e| is_type(words[e - 1]))
-            .collect();
-        let suffixed: Vec<usize> = ends
-            .iter()
-            .map(|e| e + 1)
-            .filter(|&e| e <= words.len() && DIRECTIONS.contains(&words[e - 1]))
-            .collect();
-        ends.extend(suffixed);
-        let end = ends
-            .iter()
-            .copied()
-            .find(|&e| g.has_locality(&normalise(&words[e..].join(" "))))
-            .or(ends.first().copied());
+        let last = words.len();
+        // A known suburb marks where the street ends, even if the street is misspelled.
+        let before_place =
+            (start + 2..last).find(|&e| g.has_locality(&place(&words[e..].join(" "))));
+        let typed = (start + 2..=last).find(|&e| is_type(words[e - 1]));
+        let end = before_place
+            .or(typed)
+            .or((!postcode.is_empty() && last >= start + 2).then_some(last));
         if let Some(end) = end {
+            let spelled: Vec<String> = words[start + 1..end]
+                .iter()
+                .map(|w| {
+                    let lower = w.to_lowercase();
+                    let fixed = (country == Country::UnitedStates)
+                        .then(|| corrected_keyword(&lower))
+                        .flatten();
+                    fixed.map_or(lower, str::to_string)
+                })
+                .collect();
+            let mut street = norm(&spelled.join(" "));
+            let tail = street.rsplit(' ').next().unwrap_or("").to_string();
+            if let Some(fixed) = (street_type(&tail).is_none())
+                .then(|| corrected_type(&tail))
+                .flatten()
+            {
+                street.truncate(street.len() - tail.len());
+                street.push_str(fixed);
+            }
             return Parsed::Address(Address {
                 number: house_number(words[start]),
-                street: normalise(&words[start + 1..end].join(" ")),
-                locality: normalise(&words[end..].join(" ")),
+                street,
+                locality: place(&words[end..].join(" ")),
                 postcode,
                 region,
                 confirmed: false,
@@ -337,7 +517,7 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
     }
 
     // A place on its own.
-    let whole = normalise(&words.join(" "));
+    let whole = place(&words.join(" "));
     if g.has_locality(&whole) {
         return Parsed::Area {
             locality: whole,
@@ -351,9 +531,9 @@ pub fn parse(text: &str, g: &dyn Gazetteer) -> Parsed {
         if !is_type(words[end - 1]) {
             continue;
         }
-        let street = normalise(&words[..end].join(" "));
+        let street = norm(&words[..end].join(" "));
         if g.has_street(&street) {
-            let locality = normalise(&words[end..].join(" "));
+            let locality = place(&words[end..].join(" "));
             return Parsed::Address(Address {
                 number: None,
                 street,
