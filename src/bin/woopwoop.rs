@@ -5,14 +5,14 @@ use std::io::BufRead;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
-use woopwoop::{gnaf, Country, Outcome, Pack, PackBuilder, Precision, Record};
+use woopwoop::{gnaf, search_all, Country, Outcome, Pack, PackBuilder, Precision, Record};
 
 const USAGE: &str = "usage:
   woopwoop build-gnaf <G-NAF Standard folder> <out.pack> [source label]
   woopwoop build-tsv <tsv of: number, street, locality, postcode, region, lat, lon> <out.pack> <source label> <AU|US>
-  woopwoop build-overture <addresses.tsv> <places.tsv> <roads.tsv> <out.pack> <source label> <AU|US>
-  woopwoop search <pack> <address>
-  woopwoop eval <pack> <tsv of: text, lat, lon, optional group>";
+  woopwoop build-overture <addresses.tsv> <places.tsv> <roads.tsv> <out.pack> <source label> <AU|US|CA|NZ|GB>
+  woopwoop search <pack[,pack]> <address>
+  woopwoop eval <pack[,pack]> <tsv of: text, lat, lon, optional group>";
 
 fn metres(a: (f64, f64), b: (f64, f64)) -> f64 {
     let (la, lb) = (a.0.to_radians(), b.0.to_radians());
@@ -30,7 +30,12 @@ struct Tally {
     none: u32,
 }
 
-fn eval(pack: &Pack, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Opens one pack, or several separated by commas.
+fn open_packs(list: &str) -> Result<Vec<Pack>, woopwoop::Error> {
+    list.split(',').map(Pack::open).collect()
+}
+
+fn eval(packs: &[Pack], path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(path)?;
     let mut groups: BTreeMap<String, Tally> = BTreeMap::new();
     let mut times = Vec::new();
@@ -46,8 +51,12 @@ fn eval(pack: &Pack, path: &str) -> Result<(), Box<dyn std::error::Error>> {
             .or_default();
         t.n += 1;
         let start = Instant::now();
-        let outcome = pack.search(address);
-        times.push(start.elapsed().as_micros() as u64);
+        let outcome = search_all(packs, address);
+        let took = start.elapsed().as_micros() as u64;
+        times.push(took);
+        if show && took > 50_000 {
+            eprintln!("slow {}ms  {address}", took / 1000);
+        }
         match outcome {
             Outcome::Found(found) => {
                 let top = &found[0];
@@ -164,7 +173,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 let (Ok(lat), Ok(lon)) = (lat.parse(), lon.parse()) else {
                     continue;
                 };
-                if subtype == "locality" {
+                if subtype == "postcode" {
+                    builder.add_postcode(name, lat, lon);
+                    counts[0] += 1;
+                } else if subtype == "locality" {
                     builder.add_place(name, region, lat, lon, population.parse().unwrap_or(0));
                     counts[0] += 1;
                 }
@@ -210,8 +222,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         ["search", pack, address] => {
-            let pack = Pack::open(pack)?;
-            let outcome = pack.search(address);
+            let outcome = search_all(&open_packs(pack)?, address);
             match outcome {
                 Outcome::Found(found) => found.iter().for_each(|c| {
                     println!("{:?}  {:.6}, {:.6}  {}", c.precision, c.lat, c.lon, c.label)
@@ -219,7 +230,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 Outcome::Declined(why) => println!("declined: {why:?}"),
             }
         }
-        ["eval", pack, tsv] => eval(&Pack::open(pack)?, tsv)?,
+        ["eval", pack, tsv] => eval(&open_packs(pack)?, tsv)?,
         _ => return Err(USAGE.into()),
     }
     Ok(())

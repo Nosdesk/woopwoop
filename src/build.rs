@@ -1,6 +1,8 @@
 //! Building a pack. Run offline: it holds everything in memory, then writes one file.
 
-use crate::normal::{normalise_for, normalise_place, strip_place_prefix, title, Country};
+use crate::normal::{
+    normalise_for, normalise_place, postcode_key, strip_place_prefix, title, Country,
+};
 use crate::pack::{Error, MAGIC, SECTIONS, VERSION};
 use fst::MapBuilder;
 use std::collections::HashMap;
@@ -84,6 +86,8 @@ pub struct PackBuilder {
     official: HashMap<u32, (f64, f64, u64)>,
     unplaced: Vec<Unplaced>,
     labels: Interner,
+    /// Postcode positions, kept apart from places as there can be millions.
+    postcodes: Vec<(String, i32, i32)>,
     /// Each street as written, by street id.
     street_names: Vec<String>,
 }
@@ -124,6 +128,13 @@ impl PackBuilder {
         });
     }
 
+    /// Adds a postcode's position, so a search can resolve to it with no address.
+    pub fn add_postcode(&mut self, code: &str, lat: f64, lon: f64) {
+        let code = postcode_key(code, self.country);
+        self.postcodes
+            .push((code, (lat * 1e7).round() as i32, (lon * 1e7).round() as i32));
+    }
+
     fn place_id(&mut self, locality: &str, display: &str, postcode: &str, region: &str) -> u32 {
         let key = format!("{locality}\t{postcode}\t{region}");
         let place = self.places.id(&key);
@@ -160,7 +171,8 @@ impl PackBuilder {
         let locality = normalise_place(&r.locality, self.country);
         if locality.is_empty() {
             // Placed at the end, once every town is known.
-            let (postcode, region) = (self.labels.id(&r.postcode), self.labels.id(&r.region));
+            let code = postcode_key(&r.postcode, self.country);
+            let (postcode, region) = (self.labels.id(&code), self.labels.id(&r.region));
             self.unplaced.push(Unplaced {
                 street,
                 number,
@@ -171,7 +183,8 @@ impl PackBuilder {
             });
             return;
         }
-        let place = self.place_id(&locality, &r.locality, &r.postcode, &r.region);
+        let code = postcode_key(&r.postcode, self.country);
+        let place = self.place_id(&locality, &r.locality, &code, &r.region);
         self.rows.push(Row {
             street,
             place,
@@ -307,6 +320,19 @@ impl PackBuilder {
         }
         name_offsets.extend_from_slice(&(name_text.len() as u32).to_le_bytes());
 
+        self.postcodes.sort_unstable();
+        self.postcodes.dedup_by(|a, b| a.0 == b.0);
+        let mut postcodes = MapBuilder::memory();
+        for (code, lat, lon) in &self.postcodes {
+            let packed = u64::from(*lat as u32) << 32 | u64::from(*lon as u32);
+            postcodes
+                .insert(code, packed)
+                .map_err(|e| Error::Build(e.to_string()))?;
+        }
+        let postcodes = postcodes
+            .into_inner()
+            .map_err(|e| Error::Build(e.to_string()))?;
+
         let number_text = numbers.join("\n").into_bytes();
         let mut places = String::new();
         for (i, key) in self.places.list.iter().enumerate() {
@@ -338,6 +364,7 @@ impl PackBuilder {
             meta.as_bytes(),
             &name_offsets,
             &name_text,
+            &postcodes,
         ];
         let mut out = BufWriter::new(File::create(path)?);
         out.write_all(MAGIC)?;
