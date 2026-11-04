@@ -70,7 +70,7 @@ Building takes under a minute for most countries, and about four minutes with 6 
 | Australia | 97.1% | 0.1% | |
 | New Zealand | 98.7% | 0.2% | 7 of 8 |
 | Canada | 98.8% | 0.6% | 13 of 13 |
-| United Kingdom | 98.4% | 0.5% | 12 of 12 |
+| United Kingdom | 98.2% | 0.5% | 12 of 12 |
 | United States | 92.9% | 3.0% | 25 of 28 |
 
 These scores come from addresses in the same data as the pack, with generated formats. They show how well WoopWoop reads addresses. They can't show how accurate the data is or what's missing, so they don't compare countries fairly.

@@ -176,6 +176,44 @@ fn a_british_postcode_alone_lands_on_the_postcode() {
 }
 
 #[test]
+fn a_postcode_beats_the_middle_of_a_street() {
+    let p = pack("gb-street", Country::UnitedKingdom, |b| {
+        b.add_postcode("SW1A 2AA", 51.5034, -0.1276);
+        b.add(&record(
+            "1",
+            "Downing Street",
+            "London",
+            "",
+            "ENG",
+            51.5100,
+            -0.1300,
+        ));
+    });
+    let c = &found(&p, "10 Downing Street, London SW1A 2AA")[0];
+    assert!((c.lat - 51.5034).abs() < 1e-4, "{c:?}");
+    assert_eq!(c.label, "Downing Street, SW1A 2AA");
+}
+
+#[test]
+fn british_labels_leave_out_the_region() {
+    let p = pack("gb-label", Country::UnitedKingdom, |b| {
+        b.add(&record(
+            "1",
+            "High Street",
+            "Bath",
+            "BA1 5AW",
+            "ENG",
+            51.38,
+            -2.36,
+        ))
+    });
+    assert_eq!(
+        found(&p, "1 High St, Bath")[0].label,
+        "1 High Street, Bath BA1 5AW"
+    );
+}
+
+#[test]
 fn postcodes_with_a_letter_in_the_middle_read() {
     assert!((found(&britain(), "EC1A 1BB")[0].lat - 51.5203).abs() < 1e-3);
 }
@@ -222,6 +260,14 @@ fn new_zealand_addresses_read() {
     ] {
         assert_eq!(found(&p, text)[0].locality, "Auckland Central", "{text}");
     }
+}
+
+#[test]
+fn new_zealand_labels_do_not_repeat_the_city() {
+    assert_eq!(
+        found(&zealand(), "1 Queen St, Auckland Central")[0].label,
+        "1 Queen Street, Auckland Central"
+    );
 }
 
 #[test]
