@@ -260,13 +260,18 @@ fn take_postcode(words: &mut Vec<&str>, country: Country) -> Option<String> {
 }
 
 fn is_us_zip(word: &str) -> bool {
-    let (five, rest) = word.split_at(word.len().min(5));
-    five.len() == 5
-        && five.chars().all(|c| c.is_ascii_digit())
+    // `get` declines a cut through a multibyte character, which can't be a ZIP anyway.
+    let Some(five) = word.get(..5) else {
+        return false;
+    };
+    let rest = &word[5..];
+    five.chars().all(|c| c.is_ascii_digit())
         && (rest.is_empty()
             || (rest.len() == 5
                 && rest.starts_with('-')
-                && rest[1..].chars().all(|c| c.is_ascii_digit())))
+                && rest[1..].chars().all(|c| c.is_ascii_digit()))
+            // Exports often drop the dash: "622540000".
+            || (rest.len() == 4 && rest.chars().all(|c| c.is_ascii_digit())))
 }
 
 /// American units follow the street: "123 Main St Apt 4B", "Suite 200", "#12".

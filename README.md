@@ -33,7 +33,7 @@ Each candidate has a position, a label and a `precision` of `House`, `Street` or
 
 WoopWoop reads addresses from Australia, New Zealand, Canada, the United States and the United Kingdom. It finds addresses, so it won't find a landmark by name.
 
-`search_all` searches several packs and keeps the most precise answer. That keeps sources with different licences in separate files, and improves a region by adding a pack.
+`search_all` searches several packs and keeps the most precise answer, so a region improves by adding a pack. Packs only meet during a search. Data under a different licence can stay in its own file, and a pack of addresses can use another pack's towns without storing them.
 
 ## Build a pack
 
@@ -52,8 +52,12 @@ For America, Canada and New Zealand, export addresses, towns and roads from [Ove
 python eval/overture_export.py 2026-10-21.0 US us.tsv
 python eval/overture_places.py 2026-10-21.0 US us-places.tsv
 python eval/overture_roads.py 2026-10-21.0 us-roads.tsv -125,24.4,-66.5,49.5 -170,51,-130,71.5 -161,18.8,-154,22.4
-cargo run --release -- build-overture us.tsv us-places.tsv us-roads.tsv us.pack "Overture 2026-10-21.0" US
+cargo run --release -- build-overture us.tsv /dev/null /dev/null us.pack "Overture 2026-10-21.0 addresses" US
+cargo run --release -- build-overture /dev/null us-places.tsv us-roads.tsv us-map.pack "Overture 2026-10-21.0 towns and roads" US
+cargo run --release -- search us.pack,us-map.pack "1600 Pennsylvania Ave NW, Washington, DC"
 ```
+
+Overture's towns and roads are under the ODbL and its addresses aren't, so these are two packs. Some addresses name no town, and a search works out theirs from the towns in the other pack. `woopwoop datasets us.pack` lists the source of every address, and each house found names its own in `Candidate::source`.
 
 The UK isn't in Overture. Build it from OpenStreetMap addresses, listed by `eval/osm_addresses`, and [Code-Point Open](https://www.ordnancesurvey.co.uk/products/code-point-open), converted by `eval/codepoint.py`. Add its postcode rows to the places file. Each postcode covers about 15 homes, so an address OpenStreetMap lacks still lands close by.
 
@@ -68,12 +72,14 @@ Building takes under a minute for most countries, and about four minutes with 6 
 | Held-out addresses, written 8 to 12 ways | Within 50 m | Over 1 km out | Landmarks |
 | --- | --- | --- | --- |
 | Australia | 97.1% | 0.1% | |
-| New Zealand | 98.7% | 0.2% | 7 of 8 |
-| Canada | 98.8% | 0.6% | 13 of 13 |
-| United Kingdom | 98.2% | 0.5% | 12 of 12 |
-| United States | 92.9% | 3.0% | 25 of 28 |
+| New Zealand | 98.8% | 0.1% | 7 of 8 |
+| Canada | 99.0% | 0.4% | 13 of 13 |
+| United Kingdom | 98.4% | 0.5% | 12 of 12 |
+| United States | 92.8% | 2.7% | 25 of 28 |
 
 These scores come from addresses in the same data as the pack, with generated formats. They show how well WoopWoop reads addresses. They can't show how accurate the data is or what's missing, so they don't compare countries fairly.
+
+These samples only hold addresses that name their town. About 4% of American addresses don't, including all of New York City, and they do worse: searched by town with no ZIP, 70% land within 50 m. Their labels show no town.
 
 Coverage varies. The UK pack holds 5.1 million addresses out of roughly 30 million. American data falls about 29 million addresses short, unevenly: New Hampshire and Hawaii have none in Overture, and Nevada and Georgia are far from complete. An OpenStreetMap layer helps, and the rest resolve to the street or town.
 
@@ -85,4 +91,4 @@ Run your own with `woopwoop eval`, using the `eval/formats` scripts to generate 
 
 The code is licensed under [Apache 2.0](LICENSE).
 
-Packs carry the licences of their data. G-NAF uses the [Open G-NAF EULA](https://data.gov.au/data/dataset/geocoded-national-address-file-g-naf), based on CC BY 4.0, which restricts generating addresses for sending mail. Overture's addresses come from many sources with [different licences](https://docs.overturemaps.org/attribution/). OpenStreetMap data is share-alike under the ODbL, so keep it in its own pack. Read them before distributing a pack.
+Packs carry the licences of their data. G-NAF uses the [Open G-NAF EULA](https://data.gov.au/data/dataset/geocoded-national-address-file-g-naf), based on CC BY 4.0, which restricts generating addresses for sending mail. Overture's addresses come from many sources with [different licences](https://docs.overturemaps.org/attribution/). OpenStreetMap data is share-alike under the ODbL, and so are Overture's towns and roads, which is why the steps above keep them in their own pack. Read the licences before distributing a pack.

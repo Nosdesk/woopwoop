@@ -59,6 +59,7 @@ struct Unplaced {
     number: u32,
     postcode: u32,
     region: u32,
+    origin: u32,
     lat: i32,
     lon: i32,
 }
@@ -67,6 +68,7 @@ struct Row {
     street: u32,
     place: u32,
     number: u32,
+    origin: u32,
     lat: i32,
     lon: i32,
 }
@@ -90,6 +92,8 @@ pub struct PackBuilder {
     postcodes: Vec<(String, i32, i32)>,
     /// Each street as written, by street id.
     street_names: Vec<String>,
+    /// The datasets records came from. A record's origin is its index here plus one.
+    origins: Interner,
 }
 
 impl PackBuilder {
@@ -158,6 +162,17 @@ impl PackBuilder {
     }
 
     pub fn add(&mut self, r: &Record) {
+        self.add_from(r, "");
+    }
+
+    /// Adds a record and names the dataset it came from, so a pack can credit each
+    /// source and show what removing one would take out.
+    pub fn add_from(&mut self, r: &Record, dataset: &str) {
+        let origin = if dataset.is_empty() {
+            0
+        } else {
+            self.origins.id(dataset) + 1
+        };
         let street = normalise_for(&r.street, self.country);
         if street.is_empty() {
             return;
@@ -178,6 +193,7 @@ impl PackBuilder {
                 number,
                 postcode,
                 region,
+                origin,
                 lat,
                 lon,
             });
@@ -189,6 +205,7 @@ impl PackBuilder {
             street,
             place,
             number,
+            origin,
             lat,
             lon,
         });
@@ -196,6 +213,8 @@ impl PackBuilder {
 
     /// Gives each record with no town the nearest one. This approximates a boundary
     /// lookup, so it can pick the neighbouring town near an edge.
+    /// With no town list, a record stays blank, and a search works out its town from another
+    /// pack. That keeps town data out of this pack, and so out of its licence.
     fn place_the_unplaced(&mut self) {
         let towns = std::mem::take(&mut self.towns);
         let cell = |v: f64| (v / CELL).floor() as i32;
@@ -245,6 +264,7 @@ impl PackBuilder {
                 street: u.street,
                 place,
                 number: u.number,
+                origin: u.origin,
                 lat: u.lat,
                 lon: u.lon,
             });
@@ -253,6 +273,7 @@ impl PackBuilder {
 
     /// Writes the pack and returns the number of addresses kept.
     pub fn finish(mut self, path: impl AsRef<Path>) -> Result<usize, Error> {
+        let towns = self.towns.len();
         self.place_the_unplaced();
         // Street ids become ranks in sorted key order, as the FST requires.
         let mut order: Vec<u32> = (0..self.streets.list.len() as u32).collect();
@@ -349,11 +370,24 @@ impl PackBuilder {
             ));
         }
         let meta = format!(
-            "source={}\ncountry={}\naddresses={}\n",
+            "source={}\ncountry={}\naddresses={}\ntowns={towns}\n",
             self.source,
             self.country.code(),
             self.rows.len()
         );
+
+        if self.origins.list.len() >= usize::from(u16::MAX) {
+            return Err(Error::Build("too many datasets".to_string()));
+        }
+        // One entry per record, in record order. Empty when no dataset was named.
+        let mut origins = Vec::new();
+        if !self.origins.list.is_empty() {
+            origins.reserve(self.rows.len() * 2);
+            for r in &self.rows {
+                origins.extend_from_slice(&(r.origin as u16).to_le_bytes());
+            }
+        }
+        let origin_names = self.origins.list.join("\n");
 
         let sections: [&[u8]; SECTIONS] = [
             &fst,
@@ -365,6 +399,8 @@ impl PackBuilder {
             &name_offsets,
             &name_text,
             &postcodes,
+            &origins,
+            origin_names.as_bytes(),
         ];
         let mut out = BufWriter::new(File::create(path)?);
         out.write_all(MAGIC)?;
