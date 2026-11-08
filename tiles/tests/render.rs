@@ -1,6 +1,6 @@
 //! Behaviour on small hand-built tiles, so these run with no data files.
 
-use woopwoop_tiles::{base, Labels, Theme};
+use woopwoop_tiles::{base, Labels, Palette, Theme};
 
 fn varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
@@ -196,4 +196,126 @@ fn memory_stays_bounded() {
     }
     assert!(l.has(15, 999, 0));
     assert!(!l.has(15, 0, 0));
+}
+
+#[test]
+fn railway_names_are_not_road_labels() {
+    let t = tile(
+        "roads",
+        &[
+            (
+                2,
+                "rail",
+                "Metro Tunnel (West Tunnel)",
+                line(&[(100, 1000), (3900, 1000)]),
+            ),
+            (
+                2,
+                "medium_road",
+                "Collins St",
+                line(&[(100, 3000), (3900, 3000)]),
+            ),
+        ],
+    );
+    let mut l = Labels::new();
+    l.add(&t, 15, 0, 0);
+    let svg = l.draw(15, 0, 0, &Theme::DARK);
+    assert!(!svg.contains("Metro Tunnel"), "{svg}");
+    assert!(svg.contains("Collins St"));
+    // The line itself is still drawn.
+    assert!(base(&t, 15, &Theme::DARK).contains("M50 500l1900 0"));
+}
+
+#[test]
+fn a_steep_road_reads_the_right_way_up_where_its_name_sits() {
+    // End to end this runs left to right, but its middle, where the name goes, runs
+    // right to left. The name follows the middle.
+    let t = tile(
+        "roads",
+        &[(
+            2,
+            "medium_road",
+            "Steep St",
+            line(&[(1500, 0), (2300, 1300), (1900, 2700), (2700, 4000)]),
+        )],
+    );
+    let mut l = Labels::new();
+    l.add(&t, 15, 0, 0);
+    let svg = l.draw(15, 0, 0, &Theme::DARK);
+    assert!(svg.contains("Steep St"), "{svg}");
+    assert!(svg.contains("d=\"M1350 2000"), "{svg}");
+}
+
+#[test]
+fn a_vertical_road_reads_upwards() {
+    let t = tile(
+        "roads",
+        &[(
+            2,
+            "medium_road",
+            "Upright Rd",
+            line(&[(2000, 100), (2000, 3900)]),
+        )],
+    );
+    let mut l = Labels::new();
+    l.add(&t, 15, 0, 0);
+    assert!(l.draw(15, 0, 0, &Theme::DARK).contains("d=\"M1000 1950"));
+}
+
+#[test]
+fn a_palette_colours_both_layers() {
+    let text = "010203".repeat(4) + &"0a0b0c".repeat(4) + &"aabbcc".repeat(4);
+    let p = Palette::parse(&text).unwrap();
+    let t = tile(
+        "roads",
+        &[(
+            2,
+            "major_road",
+            "High St",
+            line(&[(100, 2000), (3900, 2000)]),
+        )],
+    );
+    let svg = base(&t, 15, &p.theme());
+    assert!(svg.contains("fill=\"#010203\""), "{svg}");
+    assert!(svg.contains("stroke:#0a0b0c"), "{svg}");
+    let mut l = Labels::new();
+    l.add(&t, 15, 0, 0);
+    assert!(l.draw(15, 0, 0, &p.theme()).contains("stroke:#aabbcc"));
+}
+
+#[test]
+fn a_road_that_bends_past_upright_under_its_name_goes_unlabelled() {
+    // Mostly upwards, but the middle swings back and forth across vertical, so some
+    // letters would be upside down whichever way the name ran.
+    let t = tile(
+        "roads",
+        &[(
+            2,
+            "medium_road",
+            "Zigzag Rd",
+            line(&[
+                (2000, 3900),
+                (2100, 2400),
+                (1900, 2000),
+                (2100, 1600),
+                (2000, 100),
+            ]),
+        )],
+    );
+    let mut l = Labels::new();
+    l.add(&t, 15, 0, 0);
+    assert!(!l.draw(15, 0, 0, &Theme::DARK).contains("Zigzag Rd"));
+}
+
+#[test]
+fn a_touched_tile_is_the_last_dropped() {
+    let mut l = Labels::new();
+    for i in 0..36 {
+        l.add(&[], 15, i, 0);
+    }
+    assert!(l.touch(15, 0, 0));
+    l.add(&[], 15, 100, 0);
+    assert!(l.has(15, 0, 0), "touched, so kept");
+    assert!(!l.has(15, 1, 0), "now the oldest, so dropped");
+    assert!(!l.touch(15, 1, 0));
 }

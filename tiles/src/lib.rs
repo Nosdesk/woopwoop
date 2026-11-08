@@ -16,4 +16,4 @@ mod wasm;
 
 pub use labels::Labels;
 pub use svg::base;
-pub use theme::Theme;
+pub use theme::{Palette, Theme};
