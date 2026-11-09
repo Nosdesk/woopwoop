@@ -14,9 +14,9 @@ use std::collections::HashMap;
 const SIZE: f64 = 2048.0;
 /// The same name closer than this is a repeat.
 const NEAR: f64 = SIZE * 0.9;
-/// Tiles of candidates kept between requests. Each label image needs nine, and a
-/// dense city tile can hold thousands of candidates, so this stays small enough for
-/// a 128 MB Worker.
+/// Tiles of candidates kept between requests, least recently used dropped first.
+/// Each label image needs nine, and a dense city tile can hold thousands of
+/// candidates, so this stays small enough for a 128 MB Worker.
 const MEMORY: usize = 36;
 
 #[derive(Clone)]
@@ -70,6 +70,57 @@ fn distance(a: Point, b: Point) -> f64 {
     f64::from(b.0 - a.0).hypot(f64::from(b.1 - a.1))
 }
 
+/// The point `at` along a line, measured from its start.
+fn point_along(r: &[Point], segments: &[f64], at: f64) -> (f64, f64) {
+    let mut walked = 0.0;
+    for (k, s) in segments.iter().enumerate() {
+        if walked + s >= at && *s > 0.0 {
+            let t = ((at - walked) / s).clamp(0.0, 1.0);
+            return (
+                f64::from(r[k].0) + f64::from(r[k + 1].0 - r[k].0) * t,
+                f64::from(r[k].1) + f64::from(r[k + 1].1 - r[k].1) * t,
+            );
+        }
+        walked += s;
+    }
+    let last = r[r.len() - 1];
+    (f64::from(last.0), f64::from(last.1))
+}
+
+/// The most a stretch of text may tip past vertical before its letters read upside
+/// down.
+const UPRIGHT: f64 = 100.0;
+
+/// Which way to run text centred on this line so it reads left to right: `Some(true)`
+/// to reverse the line, `None` when no direction keeps every part of the text upright.
+/// Judged over the stretch the text covers, as a steep road can run one way end to
+/// end and the other way in its middle. `half` is half the text's length in label
+/// units, which are half of tile units. A vertical stretch reads upwards.
+fn text_direction(r: &[Point], segments: &[f64], length: f64, half: f64) -> Option<bool> {
+    let reach = (half * 2.0).min(length / 2.0);
+    let (lo, hi) = (length / 2.0 - reach, length / 2.0 + reach);
+    let a = point_along(r, segments, lo);
+    let b = point_along(r, segments, hi);
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let reverse = dx < 0.0 || (dx == 0.0 && dy > 0.0);
+    let sign = if reverse { -1.0 } else { 1.0 };
+    let mut walked = 0.0;
+    for (k, s) in segments.iter().enumerate() {
+        let (from, to) = (walked, walked + s);
+        walked = to;
+        if *s == 0.0 || to <= lo || from >= hi {
+            continue;
+        }
+        let angle = (sign * f64::from(r[k + 1].1 - r[k].1))
+            .atan2(sign * f64::from(r[k + 1].0 - r[k].0))
+            .to_degrees();
+        if angle.abs() > UPRIGHT {
+            return None;
+        }
+    }
+    Some(reverse)
+}
+
 fn places(tile: &[u8], z: u8, tx: i32, ty: i32, out: &mut Vec<Candidate>) {
     let Some(l) = read_layer(tile, "places") else {
         return;
@@ -120,6 +171,11 @@ fn roads(tile: &[u8], tx: i32, ty: i32, out: &mut Vec<Candidate>) {
             continue;
         };
         let kind = l.text(f, "kind").unwrap_or("");
+        // Railway and tram lines share the roads layer, and a line's name reads as a
+        // street that isn't there.
+        if kind == "rail" || kind == "ferry" {
+            continue;
+        }
         let need = text_width(name, 56.0) * 2.0 + 40.0;
         f.rings(|r| {
             if r.len() < 2 {
@@ -156,8 +212,12 @@ fn roads(tile: &[u8], tx: i32, ty: i32, out: &mut Vec<Candidate>) {
             let angle = f64::from(last.1 - first.1).atan2(f64::from(last.0 - first.0));
             let w = text_width(name, 56.0) / 2.0 + 10.0;
             let (gx, gy) = (f64::from(tx) * SIZE + x, f64::from(ty) * SIZE + y);
+            let Some(reverse) = text_direction(r, &segments, length, text_width(name, 56.0) / 2.0)
+            else {
+                return;
+            };
             let mut points = r.to_vec();
-            if last.0 < first.0 {
+            if reverse {
                 points.reverse();
             }
             let c = Candidate {
@@ -254,9 +314,22 @@ impl Labels {
         self.tiles.contains_key(&(z, x, y))
     }
 
-    /// Adds a tile's data. Pass an empty slice for a tile that doesn't exist.
+    /// Marks a tile as just used, so it's the last to be dropped. Returns whether it
+    /// was there. A caller about to draw touches the tiles it already has before
+    /// adding the rest, so adding can't push out one it needs.
+    pub fn touch(&mut self, z: u8, x: i32, y: i32) -> bool {
+        let Some(at) = self.order.iter().position(|k| *k == (z, x, y)) else {
+            return false;
+        };
+        let key = self.order.remove(at);
+        self.order.push(key);
+        true
+    }
+
+    /// Adds a tile's data. Pass an empty slice for a tile that doesn't exist. Adding
+    /// a tile already there only touches it.
     pub fn add(&mut self, tile: &[u8], z: u8, x: i32, y: i32) {
-        if self.has(z, x, y) {
+        if self.touch(z, x, y) {
             return;
         }
         if self.order.len() >= MEMORY {
